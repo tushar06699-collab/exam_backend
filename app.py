@@ -650,6 +650,53 @@ def get_used_days():
 def home():
     return "Backend Running", 200
 
+# ============================
+# SESSION MANAGEMENT (CUSTOM)
+# ============================
+
+sessions_col = db["sessions"]  # create new collection
+
+# ➤ ADD SESSION
+@app.route("/session/add", methods=["POST"])
+def add_session():
+    data = request.json
+    session = data.get("session")
+
+    if not session:
+        return jsonify({"success": False, "message": "Session required"}), 400
+
+    # Check duplicate
+    exists = sessions_col.find_one({"session": session})
+    if exists:
+        return jsonify({"success": False, "message": "Session already exists"}), 400
+
+    sessions_col.insert_one({"session": session})
+    return jsonify({"success": True, "message": "Session added"}), 200
+
+
+# ➤ LIST SESSIONS
+@app.route("/session/list", methods=["GET"])
+def list_sessions():
+    all_sessions = [s["session"] for s in sessions_col.find()]
+    return jsonify({"success": True, "sessions": all_sessions}), 200
+
+
+# ➤ DELETE SESSION
+@app.route("/session/delete", methods=["POST"])
+def delete_session():
+    data = request.json
+    session = data.get("session")
+
+    if not session:
+        return jsonify({"success": False, "message": "Session required"}), 400
+
+    delete_result = sessions_col.delete_one({"session": session})
+
+    if delete_result.deleted_count == 0:
+        return jsonify({"success": False, "message": "Session not found"}), 404
+
+    return jsonify({"success": True, "message": "Session deleted"}), 200
+
 # ---------------------------
 # Run app
 # ---------------------------
