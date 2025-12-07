@@ -645,6 +645,11 @@ def get_used_days():
                 used_days.add(idx + 1)
     return jsonify({"success": True, "used_days": sorted(list(used_days))})
 
+
+@app.route("/", methods=["GET"])
+def home():
+    return "Backend Running", 200
+
 # ---------------------------
 # Run app
 # ---------------------------
