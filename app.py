@@ -706,6 +706,77 @@ def delete_session():
 
     return jsonify({"success": True, "message": "Session deleted"}), 200
 
+notices_col = db["notices"]
+
+NOTICE_DIR = "notices"
+os.makedirs(NOTICE_DIR, exist_ok=True)
+
+@app.route("/notice/upload", methods=["POST"])
+def upload_notice():
+    title = request.form.get("title")
+    description = request.form.get("description", "")
+    date = request.form.get("date")    # format: YYYY-MM-DD
+    file = request.files.get("pdf")
+
+    if not title or not date or not file:
+        return jsonify({"success": False, "message": "Missing fields"}), 400
+
+    try:
+        # Create file path
+        filename = f"{datetime.utcnow().timestamp()}_{file.filename}"
+        filepath = os.path.join(NOTICE_DIR, filename)
+        file.save(filepath)
+
+        # Insert into Mongo
+        res = notices_col.insert_one({
+            "title": title,
+            "description": description,
+            "date": date,
+            "file": filename,
+            "uploaded_at": datetime.utcnow()
+        })
+
+        return jsonify({"success": True, "message": "Notice uploaded", "id": str(res.inserted_id)})
+    
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+@app.route("/notice/list", methods=["GET"])
+def list_notices():
+    notices = []
+    for n in notices_col.find().sort("uploaded_at", -1):
+        notices.append({
+            "id": str(n["_id"]),
+            "title": n.get("title"),
+            "description": n.get("description"),
+            "date": n.get("date"),
+            "file": n.get("file"),
+            "url": f"/notice/get-file/{n.get('file')}"
+        })
+    return jsonify({"success": True, "notices": notices})
+@app.route("/notice/get-file/<filename>")
+def get_notice_file(filename):
+    filepath = os.path.join(NOTICE_DIR, filename)
+    if os.path.exists(filepath):
+        return send_file(filepath)
+    return "File Not Found", 404
+@app.route("/notice/delete/<notice_id>", methods=["DELETE"])
+def delete_notice(notice_id):
+    try:
+        doc = notices_col.find_one({"_id": ObjectId(notice_id)})
+        if not doc:
+            return jsonify({"success": False, "message": "Notice not found"}), 404
+
+        # delete file
+        filepath = os.path.join(NOTICE_DIR, doc["file"])
+        if os.path.exists(filepath):
+            os.remove(filepath)
+
+        notices_col.delete_one({"_id": ObjectId(notice_id)})
+        return jsonify({"success": True, "message": "Notice deleted"})
+    
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
 # ---------------------------
 # Run app
 # ---------------------------
