@@ -462,15 +462,24 @@ def list_teachers():
 def delete_teacher(teacher_id):
     try:
         obj = ObjectId(teacher_id)
-    except Exception:
-        return jsonify({"success": False, "message": "Invalid teacher id"}), 400
-    # delete teacher
-    teachers_col.delete_one({"_id": obj})
-    # delete timetable entries for this teacher (we store teacher_id as string or ObjectId depending on usage)
-    # some existing timetable docs might store teacher_id as string id, so remove both forms
-    timetable_col.delete_many({"teacher_id": teacher_id})
-    timetable_col.delete_many({"teacher_id": obj})
-    return jsonify({"success": True, "message": "Teacher and their timetable deleted successfully"})
+    except:
+        obj = None
+
+    # 1) Delete teacher
+    teachers_col.delete_one({"_id": ObjectId(teacher_id)})
+
+    # 2) Delete ALL timetable rows (string or ObjectId stored)
+    delete_filter = {"$or": [
+        {"teacher_id": teacher_id},      # stored as string
+        {"teacher_id": str(teacher_id)}, # also string (safety)
+    ]}
+
+    if obj:
+        delete_filter["$or"].append({"teacher_id": obj})  # stored as ObjectId
+
+    timetable_col.delete_many(delete_filter)
+
+    return jsonify({"success": True, "message": "Teacher and full timetable deleted"})
 
 # ---------------------------
 # Login (admin + teacher)
