@@ -778,6 +778,206 @@ def delete_notice(notice_id):
         return jsonify({"success": False, "message": str(e)}), 500
 
 # ---------------------------
+# Attendance collection
+# ---------------------------
+attendance_col = db["attendance"]
+
+# ---------------------------
+# Add or update attendance
+# ---------------------------
+@app.route("/attendance/save", methods=["POST"])
+def save_attendance():
+    """
+    Payload Example:
+    {
+        "session": "2025-2026",
+        "class_name": "Class 1",
+        "date": "2025-12-08",
+        "attendance": [
+            {"student_id": "64fb...a", "status": "present"},
+            {"student_id": "64fb...b", "status": "absent"},
+            {"student_id": "64fb...c", "status": "leave"}
+        ]
+    }
+    """
+    data = request.json or {}
+    session = data.get("session")
+    class_name = data.get("class_name")
+    date = data.get("date")
+    attendance_list = data.get("attendance", [])
+
+    if not session or not class_name or not date or not attendance_list:
+        return jsonify({"success": False, "message": "Missing fields"}), 400
+
+    # Remove old attendance for same class+date
+    attendance_col.delete_many({"session": session, "class_name": class_name, "date": date})
+
+    # Insert new attendance
+    to_insert = []
+    for att in attendance_list:
+        student_id = att.get("student_id")
+        status = att.get("status")
+        if student_id and status in ["present", "absent", "leave"]:
+            to_insert.append({
+                "session": session,
+                "class_name": class_name,
+                "date": date,
+                "student_id": student_id,
+                "status": status
+            })
+
+    if to_insert:
+        attendance_col.insert_many(to_insert)
+
+    return jsonify({"success": True, "message": "Attendance saved successfully"})
+
+# ---------------------------
+# Get attendance for class + date
+# ---------------------------
+@app.route("/attendance/list", methods=["GET"])
+def list_attendance():
+    """
+    Query params:
+        session=2025-2026
+        class_name=Class 1
+        date=2025-12-08
+    """
+    session = request.args.get("session")
+    class_name = request.args.get("class_name")
+    date = request.args.get("date")
+
+    if not session or not class_name or not date:
+        return jsonify({"success": False, "attendance": [], "message": "Missing parameters"}), 400
+
+    cursor = attendance_col.find({"session": session, "class_name": class_name, "date": date})
+    records = []
+    for att in cursor:
+        records.append({
+            "student_id": att.get("student_id"),
+            "status": att.get("status")
+        })
+
+    return jsonify({"success": True, "attendance": records})
+
+# ---------------------------
+# Leave Applications Collection
+# ---------------------------
+leave_col = db["leave_applications"]
+
+LEAVE_DIR = "leave_docs"
+os.makedirs(LEAVE_DIR, exist_ok=True)
+
+# ---------------------------
+# Submit leave request
+# ---------------------------
+@app.route("/leave/submit", methods=["POST"])
+def submit_leave():
+    """
+    Payload via form-data:
+        - teacher_id (required)
+        - session (required)
+        - start_date (required, YYYY-MM-DD)
+        - end_date (required, YYYY-MM-DD)
+        - reason (required)
+        - document (optional, file)
+    """
+    teacher_id = request.form.get("teacher_id")
+    session = request.form.get("session")
+    start_date = request.form.get("start_date")
+    end_date = request.form.get("end_date")
+    reason = request.form.get("reason")
+    file = request.files.get("document")  # optional
+
+    if not all([teacher_id, session, start_date, end_date, reason]):
+        return jsonify({"success": False, "message": "Missing fields"}), 400
+
+    filename = ""
+    if file:
+        filename = f"{datetime.utcnow().timestamp()}_{file.filename}"
+        filepath = os.path.join(LEAVE_DIR, filename)
+        file.save(filepath)
+
+    doc = {
+        "teacher_id": teacher_id,
+        "session": session,
+        "start_date": start_date,
+        "end_date": end_date,
+        "reason": reason,
+        "document": filename,  # empty string if no file
+        "status": "pending",   # default status: pending
+        "submitted_at": datetime.utcnow()
+    }
+
+    res = leave_col.insert_one(doc)
+
+    return jsonify({"success": True, "message": "Leave submitted", "leave_id": str(res.inserted_id)})
+
+# ---------------------------
+# List leave applications (admin view)
+# ---------------------------
+@app.route("/leave/list", methods=["GET"])
+def list_leave():
+    """
+    Optional query params:
+        - status=pending/approved/rejected
+        - teacher_id=<id>
+    """
+    query = {}
+    status = request.args.get("status")
+    teacher_id = request.args.get("teacher_id")
+
+    if status:
+        query["status"] = status
+    if teacher_id:
+        query["teacher_id"] = teacher_id
+
+    leaves = []
+    for l in leave_col.find(query).sort("submitted_at", -1):
+        leaves.append({
+            "id": str(l["_id"]),
+            "teacher_id": l["teacher_id"],
+            "session": l["session"],
+            "start_date": l["start_date"],
+            "end_date": l["end_date"],
+            "reason": l["reason"],
+            "document": l["document"],
+            "document_url": f"/leave/get-document/{l['document']}" if l["document"] else "",
+            "status": l["status"],
+            "submitted_at": l["submitted_at"].strftime("%Y-%m-%d %H:%M:%S")
+        })
+    return jsonify({"success": True, "leaves": leaves})
+
+# ---------------------------
+# Approve / Reject leave (admin action)
+# ---------------------------
+@app.route("/leave/update-status/<leave_id>", methods=["POST"])
+def update_leave_status(leave_id):
+    """
+    Payload:
+        - status: approved / rejected
+    """
+    data = request.json or {}
+    status = data.get("status")
+    if status not in ["approved", "rejected"]:
+        return jsonify({"success": False, "message": "Invalid status"}), 400
+
+    res = leave_col.update_one({"_id": ObjectId(leave_id)}, {"$set": {"status": status}})
+    if res.modified_count == 0:
+        return jsonify({"success": False, "message": "Leave not found or status unchanged"}), 404
+
+    return jsonify({"success": True, "message": f"Leave {status} successfully"})
+
+# ---------------------------
+# Get leave document
+# ---------------------------
+@app.route("/leave/get-document/<filename>")
+def get_leave_document(filename):
+    filepath = os.path.join(LEAVE_DIR, filename)
+    if os.path.exists(filepath):
+        return send_file(filepath)
+    return "File Not Found", 404
+
+# ---------------------------
 # Run app
 # ---------------------------
 if __name__ == "__main__":
