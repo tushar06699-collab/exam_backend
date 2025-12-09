@@ -938,14 +938,24 @@ def list_leave():
 
     leaves = []
     for l in leave_col.find(query).sort("submitted_at", -1):
-        # Get teacher name from teachers_col
-        teacher_doc = teachers_col.find_one({"teacher_id": l["teacher_id"], "session": l["session"]})
-        teacher_name = teacher_doc.get("name") if teacher_doc else "Unknown"
+        teacher_name = "Unknown"
+        t_id = l.get("teacher_id")
+        if t_id:
+            # Attempt to fetch teacher by Mongo _id
+            try:
+                t_doc = teachers_col.find_one({"_id": ObjectId(t_id)})
+                if t_doc:
+                    teacher_name = t_doc.get("name", "Unknown")
+            except Exception:
+                # If t_id is not a valid ObjectId, fallback to search by custom teacher_id
+                t_doc = teachers_col.find_one({"teacher_id": t_id, "session": l.get("session")})
+                if t_doc:
+                    teacher_name = t_doc.get("name", "Unknown")
 
         leaves.append({
             "id": str(l["_id"]),
             "teacher_id": l["teacher_id"],
-            "teacher_name": teacher_name,          # NEW FIELD
+            "teacher_name": teacher_name,          
             "session": l["session"],
             "start_date": l["start_date"],
             "end_date": l["end_date"],
@@ -955,6 +965,7 @@ def list_leave():
             "status": l["status"],
             "submitted_at": l["submitted_at"].strftime("%Y-%m-%d %H:%M:%S")
         })
+
     return jsonify({"success": True, "leaves": leaves})
 
 # ---------------------------
