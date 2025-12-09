@@ -903,19 +903,45 @@ LEAVE_DIR = "leave_docs"
 os.makedirs(LEAVE_DIR, exist_ok=True)
 
 # ---------------------------
+# Helper: Resolve teacher document reliably
+# ---------------------------
+def get_teacher_doc(tid, session=None):
+    """
+    Resolves teacher document by:
+    1️⃣ _id (ObjectId)
+    2️⃣ teacher_id + optional session
+    3️⃣ teacher_id only
+    4️⃣ username
+    Automatically trims trailing commas/spaces.
+    """
+    tid = str(tid).strip().rstrip(",")
+    session = session.strip().rstrip(",") if session else None
+
+    teacher_doc = None
+
+    # 1. Try ObjectId
+    if ObjectId.is_valid(tid):
+        teacher_doc = teachers_col.find_one({"_id": ObjectId(tid)})
+
+    # 2. Try teacher_id + session
+    if not teacher_doc and session:
+        teacher_doc = teachers_col.find_one({"teacher_id": tid, "session": session})
+
+    # 3. Try teacher_id only
+    if not teacher_doc:
+        teacher_doc = teachers_col.find_one({"teacher_id": tid})
+
+    # 4. Try username
+    if not teacher_doc:
+        teacher_doc = teachers_col.find_one({"username": tid})
+
+    return teacher_doc
+
+# ---------------------------
 # Submit leave request
 # ---------------------------
 @app.route("/leave/submit", methods=["POST"])
 def submit_leave():
-    """
-    Payload via form-data:
-        - teacher_id (required)
-        - session (required)
-        - start_date (required, YYYY-MM-DD)
-        - end_date (required, YYYY-MM-DD)
-        - reason (required)
-        - document (optional, file)
-    """
     teacher_id = request.form.get("teacher_id")
     session = request.form.get("session")
     start_date = request.form.get("start_date")
@@ -933,13 +959,13 @@ def submit_leave():
         file.save(filepath)
 
     doc = {
-        "teacher_id": teacher_id,
-        "session": session,
+        "teacher_id": teacher_id.strip().rstrip(","),
+        "session": session.strip().rstrip(","),
         "start_date": start_date,
         "end_date": end_date,
         "reason": reason,
-        "document": filename,  # empty string if no file
-        "status": "pending",   # default status: pending
+        "document": filename,
+        "status": "pending",
         "submitted_at": datetime.utcnow()
     }
 
@@ -950,37 +976,6 @@ def submit_leave():
 # ---------------------------
 # List leave applications (admin view)
 # ---------------------------
-def get_teacher_doc(tid, session=None):
-    """
-    Resolves teacher document by:
-    1️⃣ _id (ObjectId)
-    2️⃣ teacher_id + optional session
-    3️⃣ username
-    """
-    tid = str(tid).strip().rstrip(",")  # Remove trailing commas/spaces
-    session = session.strip().rstrip(",") if session else None
-
-    teacher_doc = None
-
-    # 1. Try ObjectId
-    if ObjectId.is_valid(tid):
-        teacher_doc = teachers_col.find_one({"_id": ObjectId(tid)})
-
-    # 2. Try teacher_id + session
-    if not teacher_doc and session:
-        teacher_doc = teachers_col.find_one({"teacher_id": tid, "session": session})
-
-    # 3. Try teacher_id without session
-    if not teacher_doc:
-        teacher_doc = teachers_col.find_one({"teacher_id": tid})
-
-    # 4. Try username
-    if not teacher_doc:
-        teacher_doc = teachers_col.find_one({"username": tid})
-
-    return teacher_doc
-
-
 @app.route("/leave/list", methods=["GET"])
 def list_leave():
     query = {}
@@ -1019,24 +1014,19 @@ def list_leave():
         })
 
     return jsonify({"success": True, "leaves": leaves})
+
 # ---------------------------
 # Approve / Reject leave (admin action)
 # ---------------------------
 @app.route("/leave/update-status/<leave_id>", methods=["POST"])
 def update_leave_status(leave_id):
-    """
-    Payload:
-        - status: approved / rejected
-        - message: optional message to teacher
-    """
     data = request.json or {}
     status = data.get("status")
-    message = data.get("message", "")  # optional
+    message = data.get("message", "")
 
     if status not in ["approved", "rejected"]:
         return jsonify({"success": False, "message": "Invalid status"}), 400
 
-    # Update status and save admin message
     res = leave_col.update_one(
         {"_id": ObjectId(leave_id)},
         {"$set": {"status": status, "admin_message": message}}
@@ -1047,20 +1037,15 @@ def update_leave_status(leave_id):
 
     return jsonify({"success": True, "message": f"Leave {status} successfully"})
 
+# ---------------------------
+# Teacher view: list own leaves
+# ---------------------------
 @app.route("/leave/teacher/<teacher_id>", methods=["GET"])
 def teacher_leave_status(teacher_id):
-    """
-    Fetch all leaves for a given teacher.
-    Works with:
-      - MongoDB _id (ObjectId)
-      - 4-digit teacher_id (string)
-      - username
-    """
     teacher_doc = get_teacher_doc(teacher_id)
     if not teacher_doc:
         return jsonify({"success": False, "message": "Teacher not found"}), 404
 
-    # Use all possible identifiers stored in leave_col
     identifiers = [
         str(teacher_doc["_id"]),
         teacher_doc.get("teacher_id"),
