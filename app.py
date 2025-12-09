@@ -437,14 +437,24 @@ def add_teacher():
 
     if not session or not username or not password or not name:
         return jsonify({"success": False, "message": "Missing fields"}), 400
+
+    # Generate 4-digit teacher_id per session
+    last_teacher = teachers_col.find({"session": session}).sort("teacher_id", -1).limit(1)
+    try:
+        last_id = int(last_teacher[0]["teacher_id"]) if last_teacher.count() > 0 else 0
+    except:
+        last_id = 0
+    new_id = f"{last_id + 1:04d}"  # 4-digit string, e.g., "0001"
+
     try:
         teachers_col.insert_one({
+            "teacher_id": new_id,
             "session": session,
             "username": username,
             "password": password,
             "name": name
         })
-        return jsonify({"success": True, "message": "Teacher added"})
+        return jsonify({"success": True, "message": "Teacher added", "teacher_id": new_id})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
 
@@ -917,11 +927,6 @@ def submit_leave():
 # ---------------------------
 @app.route("/leave/list", methods=["GET"])
 def list_leave():
-    """
-    Optional query params:
-        - status=pending/approved/rejected
-        - teacher_id=<id>
-    """
     query = {}
     status = request.args.get("status")
     teacher_id = request.args.get("teacher_id")
@@ -933,9 +938,14 @@ def list_leave():
 
     leaves = []
     for l in leave_col.find(query).sort("submitted_at", -1):
+        # Get teacher name from teachers_col
+        teacher_doc = teachers_col.find_one({"teacher_id": l["teacher_id"], "session": l["session"]})
+        teacher_name = teacher_doc.get("name") if teacher_doc else "Unknown"
+
         leaves.append({
             "id": str(l["_id"]),
             "teacher_id": l["teacher_id"],
+            "teacher_name": teacher_name,          # NEW FIELD
             "session": l["session"],
             "start_date": l["start_date"],
             "end_date": l["end_date"],
@@ -955,17 +965,41 @@ def update_leave_status(leave_id):
     """
     Payload:
         - status: approved / rejected
+        - message: optional message to teacher
     """
     data = request.json or {}
     status = data.get("status")
+    message = data.get("message", "")  # optional
+
     if status not in ["approved", "rejected"]:
         return jsonify({"success": False, "message": "Invalid status"}), 400
 
-    res = leave_col.update_one({"_id": ObjectId(leave_id)}, {"$set": {"status": status}})
+    # Update status and save admin message
+    res = leave_col.update_one(
+        {"_id": ObjectId(leave_id)},
+        {"$set": {"status": status, "admin_message": message}}
+    )
+
     if res.modified_count == 0:
         return jsonify({"success": False, "message": "Leave not found or status unchanged"}), 404
 
     return jsonify({"success": True, "message": f"Leave {status} successfully"})
+
+@app.route("/leave/teacher/<teacher_id>", methods=["GET"])
+def teacher_leave_status(teacher_id):
+    leaves = []
+    for l in leave_col.find({"teacher_id": teacher_id}).sort("submitted_at", -1):
+        leaves.append({
+            "leave_id": str(l["_id"]),
+            "session": l["session"],
+            "start_date": l["start_date"],
+            "end_date": l["end_date"],
+            "reason": l["reason"],
+            "status": l["status"],
+            "admin_message": l.get("admin_message", ""),
+            "submitted_at": l["submitted_at"].strftime("%Y-%m-%d %H:%M:%S")
+        })
+    return jsonify({"success": True, "leaves": leaves})
 
 # ---------------------------
 # Get leave document
