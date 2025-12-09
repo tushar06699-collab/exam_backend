@@ -950,44 +950,56 @@ def submit_leave():
 # ---------------------------
 # List leave applications (admin view)
 # ---------------------------
+def get_teacher_doc(tid, session=None):
+    """
+    Resolves teacher document by:
+    1️⃣ _id (ObjectId)
+    2️⃣ teacher_id + optional session
+    3️⃣ username
+    """
+    tid = str(tid).strip().rstrip(",")  # Remove trailing commas/spaces
+    session = session.strip().rstrip(",") if session else None
+
+    teacher_doc = None
+
+    # 1. Try ObjectId
+    if ObjectId.is_valid(tid):
+        teacher_doc = teachers_col.find_one({"_id": ObjectId(tid)})
+
+    # 2. Try teacher_id + session
+    if not teacher_doc and session:
+        teacher_doc = teachers_col.find_one({"teacher_id": tid, "session": session})
+
+    # 3. Try teacher_id without session
+    if not teacher_doc:
+        teacher_doc = teachers_col.find_one({"teacher_id": tid})
+
+    # 4. Try username
+    if not teacher_doc:
+        teacher_doc = teachers_col.find_one({"username": tid})
+
+    return teacher_doc
+
+
 @app.route("/leave/list", methods=["GET"])
 def list_leave():
-    """
-    Admin view: lists leaves with teacher names.
-    Optional query params:
-        - status: approved / rejected / pending
-        - teacher_id: filter by teacher
-    """
     query = {}
     status = request.args.get("status")
     teacher_id = request.args.get("teacher_id")
 
     if status:
-        query["status"] = status
+        query["status"] = status.strip().lower()
     if teacher_id:
-        query["teacher_id"] = teacher_id
+        query["teacher_id"] = teacher_id.strip().rstrip(",")
 
     leaves = []
     for l in leave_col.find(query).sort("submitted_at", -1):
-        teacher_name = "Unknown"
         t_id = l.get("teacher_id")
         session = l.get("session")
+        teacher_name = "Unknown"
 
         if t_id:
-            t_doc = None
-
-            # Try fetching by MongoDB _id
-            if ObjectId.is_valid(str(t_id)):
-                t_doc = teachers_col.find_one({"_id": ObjectId(t_id)})
-
-            # Try fetching by 4-digit teacher_id + session
-            if not t_doc and session:
-                t_doc = teachers_col.find_one({"teacher_id": t_id, "session": session})
-
-            # Fallback: try fetching by username (in case t_id is username)
-            if not t_doc:
-                t_doc = teachers_col.find_one({"username": t_id})
-
+            t_doc = get_teacher_doc(t_id, session)
             if t_doc:
                 teacher_name = t_doc.get("name", "Unknown")
 
@@ -1007,7 +1019,6 @@ def list_leave():
         })
 
     return jsonify({"success": True, "leaves": leaves})
-
 # ---------------------------
 # Approve / Reject leave (admin action)
 # ---------------------------
@@ -1038,32 +1049,30 @@ def update_leave_status(leave_id):
 
 @app.route("/leave/teacher/<teacher_id>", methods=["GET"])
 def teacher_leave_status(teacher_id):
-    # Fetch teacher name
-    teacher_name = "Unknown"
-    t_doc = None
+    """
+    Fetch all leaves for a given teacher.
+    Works with:
+      - MongoDB _id (ObjectId)
+      - 4-digit teacher_id (string)
+      - username
+    """
+    teacher_doc = get_teacher_doc(teacher_id)
+    if not teacher_doc:
+        return jsonify({"success": False, "message": "Teacher not found"}), 404
 
-    # Try fetching by MongoDB _id
-    if ObjectId.is_valid(str(teacher_id)):
-        t_doc = teachers_col.find_one({"_id": ObjectId(teacher_id)})
+    # Use all possible identifiers stored in leave_col
+    identifiers = [
+        str(teacher_doc["_id"]),
+        teacher_doc.get("teacher_id"),
+        teacher_doc.get("username")
+    ]
 
-    # Try fetching by 4-digit teacher_id + session (any session)
-    if not t_doc:
-        t_doc = teachers_col.find_one({"teacher_id": teacher_id})
-
-    # Fallback: try username
-    if not t_doc:
-        t_doc = teachers_col.find_one({"username": teacher_id})
-
-    if t_doc:
-        teacher_name = t_doc.get("name", "Unknown")
-
-    # Fetch leave applications for this teacher
     leaves = []
-    for l in leave_col.find({"teacher_id": teacher_id}).sort("submitted_at", -1):
+    for l in leave_col.find({"teacher_id": {"$in": identifiers}}).sort("submitted_at", -1):
         leaves.append({
             "leave_id": str(l["_id"]),
-            "teacher_id": teacher_id,
-            "teacher_name": teacher_name,
+            "teacher_id": l.get("teacher_id"),
+            "teacher_name": teacher_doc.get("name", "Unknown"),
             "session": l.get("session"),
             "start_date": l.get("start_date"),
             "end_date": l.get("end_date"),
