@@ -491,6 +491,31 @@ def delete_teacher(teacher_id):
 
     return jsonify({"success": True, "message": "Teacher and full timetable deleted"})
 
+@app.route("/teacher/<teacher_id>", methods=["GET"])
+def get_teacher(teacher_id):
+    teacher = None
+
+    # Try MongoDB ObjectId first
+    try:
+        obj_id = ObjectId(teacher_id)
+        teacher = teachers_col.find_one({"_id": obj_id})
+    except:
+        pass
+
+    # If not found, try custom teacher_id (your 4-digit ID)
+    if not teacher:
+        teacher = teachers_col.find_one({"teacher_id": teacher_id})
+
+    if teacher:
+        return jsonify({
+            "id": str(teacher.get("_id")),
+            "teacher_id": teacher.get("teacher_id"),
+            "name": teacher.get("name"),
+            "username": teacher.get("username"),
+            "session": teacher.get("session")
+        })
+    else:
+        return jsonify({"error": "Teacher not found"}), 404
 # ---------------------------
 # Login (admin + teacher)
 # ---------------------------
@@ -503,7 +528,7 @@ def login():
         return jsonify({"success": False, "message": "Missing login details"}), 400
 
     # admin case — keep as before
-    if username == "admin" and password == "admin":
+    if username == "admin" and password == "PS*100":
         return jsonify({"success": True, "role": "admin", "token": "admin_token"})
 
     # teacher login
