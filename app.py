@@ -927,6 +927,12 @@ def submit_leave():
 # ---------------------------
 @app.route("/leave/list", methods=["GET"])
 def list_leave():
+    """
+    Admin view: lists leaves with teacher names.
+    Optional query params:
+        - status: approved / rejected / pending
+        - teacher_id: filter by teacher
+    """
     query = {}
     status = request.args.get("status")
     teacher_id = request.args.get("teacher_id")
@@ -940,30 +946,38 @@ def list_leave():
     for l in leave_col.find(query).sort("submitted_at", -1):
         teacher_name = "Unknown"
         t_id = l.get("teacher_id")
+        session = l.get("session")
+
         if t_id:
-            # Attempt to fetch teacher by Mongo _id
+            t_doc = None
+            # Try 1: search by Mongo _id (if stored as ObjectId string)
             try:
-                t_doc = teachers_col.find_one({"_id": ObjectId(t_id)})
-                if t_doc:
-                    teacher_name = t_doc.get("name", "Unknown")
+                if ObjectId.is_valid(str(t_id)):
+                    t_doc = teachers_col.find_one({"_id": ObjectId(t_id)})
             except Exception:
-                # If t_id is not a valid ObjectId, fallback to search by custom teacher_id
-                t_doc = teachers_col.find_one({"teacher_id": t_id, "session": l.get("session")})
-                if t_doc:
-                    teacher_name = t_doc.get("name", "Unknown")
+                t_doc = None
+
+            # Try 2: search by custom teacher_id + session
+            if not t_doc:
+                t_doc = teachers_col.find_one({"teacher_id": t_id, "session": session})
+
+            # Set teacher name
+            if t_doc:
+                teacher_name = t_doc.get("name", "Unknown")
 
         leaves.append({
             "id": str(l["_id"]),
-            "teacher_id": l["teacher_id"],
-            "teacher_name": teacher_name,          
-            "session": l["session"],
-            "start_date": l["start_date"],
-            "end_date": l["end_date"],
-            "reason": l["reason"],
-            "document": l["document"],
-            "document_url": f"/leave/get-document/{l['document']}" if l["document"] else "",
-            "status": l["status"],
-            "submitted_at": l["submitted_at"].strftime("%Y-%m-%d %H:%M:%S")
+            "teacher_id": t_id,
+            "teacher_name": teacher_name,
+            "session": session,
+            "start_date": l.get("start_date"),
+            "end_date": l.get("end_date"),
+            "reason": l.get("reason"),
+            "document": l.get("document", ""),
+            "document_url": f"/leave/get-document/{l['document']}" if l.get("document") else "",
+            "status": l.get("status"),
+            "admin_message": l.get("admin_message", ""),
+            "submitted_at": l.get("submitted_at").strftime("%Y-%m-%d %H:%M:%S")
         })
 
     return jsonify({"success": True, "leaves": leaves})
