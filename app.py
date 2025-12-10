@@ -909,14 +909,7 @@ os.makedirs(LEAVE_DIR, exist_ok=True)
 # Teacher lookup
 # ---------------------------
 def get_teacher_doc(tid, session=None):
-    """
-    Always correctly fetch teacher by:
-    - teacher_id + session
-    - _id
-    - username + session
-    - fallback teacher_id
-    - fallback username
-    """
+
     tid = str(tid).strip().rstrip(",")
     session = session.strip().rstrip(",") if session else None
 
@@ -926,25 +919,30 @@ def get_teacher_doc(tid, session=None):
         if doc:
             return doc
 
-    # If valid ObjectId → check _id
-    if ObjectId.is_valid(tid):
-        doc = teachers_col.find_one({"_id": ObjectId(tid)})
-        if doc:
-            return doc
-
-    # username + session
+    # Try match by username + session
     if session:
         doc = teachers_col.find_one({"username": tid, "session": session})
         if doc:
             return doc
 
-    # fallback teacher_id
+    # Match by ObjectId
+    if ObjectId.is_valid(tid):
+        doc = teachers_col.find_one({"_id": ObjectId(tid)})
+        if doc:
+            return doc
+
+    # FALLBACK MATCH → teacher_id (ANY session)
     doc = teachers_col.find_one({"teacher_id": tid})
     if doc:
         return doc
 
-    # fallback username
-    return teachers_col.find_one({"username": tid})
+    # FALLBACK MATCH → username (ANY session)
+    doc = teachers_col.find_one({"username": tid})
+    if doc:
+        return doc
+
+    # Not found
+    return None
 
 
 # ---------------------------
@@ -1013,8 +1011,10 @@ def list_leave():
         teacher_name = "Unknown"
 
         if t_id:
-            t_doc = get_teacher_doc(t_id, session)
-            if t_doc:
+                  print("DEBUG:", t_id, session)
+                  t_doc = get_teacher_doc(t_id, session)
+                  print("FOUND TEACHER:", t_doc)
+        if t_doc:
                 teacher_name = t_doc.get("name", "Unknown").strip()
 
         leaves.append({
