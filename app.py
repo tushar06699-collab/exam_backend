@@ -566,31 +566,47 @@ def login():
     data = request.json or {}
     username = data.get("username")
     password = data.get("password")
+
     if not username or not password:
         return jsonify({"success": False, "message": "Missing login details"}), 400
 
-    # admin case — keep as before
-    if username == "admin" and password == "PS*100":
-        return jsonify({"success": True, "role": "admin", "token": "admin_token"})
+    # ---------- ADMIN LOGIN (HARD-CODED) ----------
+    if username == "Admin" and password == "PS*100":
+        return jsonify({
+            "success": True,
+            "role": "admin",
+            "token": "admin_token"
+        })
 
-    # teacher login
-    t = teachers_col.find_one({"username": username, "password": password})
-    if t:
-        teacher_id = str(t.get("_id"))
+    # ---------- PRINCIPAL LOGIN (HARD-CODED) ----------
+    if username == "Naveen" and password == "14112017":
+        return jsonify({
+            "success": True,
+            "role": "principal",
+            "token": "principal_token",
+            "principal": {
+                "name": "School Principal",
+                "username": "principal"
+            }
+        })
+
+    # ---------- TEACHER LOGIN (FROM DATABASE) ----------
+    teacher = teachers_col.find_one({"username": username, "password": password})
+    if teacher:
         return jsonify({
             "success": True,
             "role": "teacher",
             "token": f"teacher_{username}_token",
             "teacher": {
-                "id": teacher_id,
-                "name": t.get("name"),
-                "username": username,
-                "session": t.get("session")
+                "id": str(teacher.get("_id")),
+                "name": teacher.get("name"),
+                "username": teacher.get("username"),
+                "session": teacher.get("session")
             }
         })
-    # else invalid
-    return jsonify({"success": False, "message": "Invalid username or password"}), 401
 
+    # ---------- INVALID LOGIN ----------
+    return jsonify({"success": False, "message": "Invalid username or password"}), 401
 # ---------------------------
 # Get timetable for a teacher
 # ---------------------------
