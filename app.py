@@ -907,35 +907,41 @@ os.makedirs(LEAVE_DIR, exist_ok=True)
 # ---------------------------
 def get_teacher_doc(tid, session=None):
     """
-    Resolves teacher document by:
-    1️⃣ _id (ObjectId)
-    2️⃣ teacher_id + optional session
-    3️⃣ teacher_id only
-    4️⃣ username
-    Automatically trims trailing commas/spaces.
+    Always correctly fetch teacher by:
+    - teacher_id + session (strongest match)
+    - _id
+    - username + session
+    - fallback teacher_id
     """
+
     tid = str(tid).strip().rstrip(",")
     session = session.strip().rstrip(",") if session else None
 
-    teacher_doc = None
+    # CASE 1: teacher_id + session (BEST MATCH)
+    if session:
+        doc = teachers_col.find_one({"teacher_id": tid, "session": session})
+        if doc:
+            return doc
 
-    # 1. Try ObjectId
+    # CASE 2: If valid ObjectId, check _id
     if ObjectId.is_valid(tid):
-        teacher_doc = teachers_col.find_one({"_id": ObjectId(tid)})
+        doc = teachers_col.find_one({"_id": ObjectId(tid)})
+        if doc:
+            return doc
 
-    # 2. Try teacher_id + session
-    if not teacher_doc and session:
-        teacher_doc = teachers_col.find_one({"teacher_id": tid, "session": session})
+    # CASE 3: username + session
+    if session:
+        doc = teachers_col.find_one({"username": tid, "session": session})
+        if doc:
+            return doc
 
-    # 3. Try teacher_id only
-    if not teacher_doc:
-        teacher_doc = teachers_col.find_one({"teacher_id": tid})
+    # CASE 4: fallback legacy teacher_id (without session)
+    doc = teachers_col.find_one({"teacher_id": tid})
+    if doc:
+        return doc
 
-    # 4. Try username
-    if not teacher_doc:
-        teacher_doc = teachers_col.find_one({"username": tid})
-
-    return teacher_doc
+    # CASE 5: fallback username
+    return teachers_col.find_one({"username": tid})
 
 # ---------------------------
 # Submit leave request
