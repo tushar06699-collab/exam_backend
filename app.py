@@ -905,43 +905,47 @@ os.makedirs(LEAVE_DIR, exist_ok=True)
 # ---------------------------
 # Helper: Resolve teacher document reliably
 # ---------------------------
+# ---------------------------
+# Teacher lookup
+# ---------------------------
 def get_teacher_doc(tid, session=None):
     """
     Always correctly fetch teacher by:
-    - teacher_id + session (strongest match)
+    - teacher_id + session
     - _id
     - username + session
     - fallback teacher_id
+    - fallback username
     """
-
     tid = str(tid).strip().rstrip(",")
     session = session.strip().rstrip(",") if session else None
 
-    # CASE 1: teacher_id + session (BEST MATCH)
+    # BEST MATCH → teacher_id + session
     if session:
         doc = teachers_col.find_one({"teacher_id": tid, "session": session})
         if doc:
             return doc
 
-    # CASE 2: If valid ObjectId, check _id
+    # If valid ObjectId → check _id
     if ObjectId.is_valid(tid):
         doc = teachers_col.find_one({"_id": ObjectId(tid)})
         if doc:
             return doc
 
-    # CASE 3: username + session
+    # username + session
     if session:
         doc = teachers_col.find_one({"username": tid, "session": session})
         if doc:
             return doc
 
-    # CASE 4: fallback legacy teacher_id (without session)
+    # fallback teacher_id
     doc = teachers_col.find_one({"teacher_id": tid})
     if doc:
         return doc
 
-    # CASE 5: fallback username
+    # fallback username
     return teachers_col.find_one({"username": tid})
+
 
 # ---------------------------
 # Submit leave request
@@ -953,11 +957,12 @@ def submit_leave():
     start_date = request.form.get("start_date")
     end_date = request.form.get("end_date")
     reason = request.form.get("reason")
-    file = request.files.get("document")  # optional
+    file = request.files.get("document")  # optional file
 
     if not all([teacher_id, session, start_date, end_date, reason]):
         return jsonify({"success": False, "message": "Missing fields"}), 400
 
+    # Save document if uploaded
     filename = ""
     if file:
         filename = f"{datetime.utcnow().timestamp()}_{file.filename}"
@@ -972,15 +977,21 @@ def submit_leave():
         "reason": reason,
         "document": filename,
         "status": "pending",
-        "submitted_at": datetime.utcnow()
+        "submitted_at": datetime.utcnow(),
+        "admin_message": ""
     }
 
     res = leave_col.insert_one(doc)
 
-    return jsonify({"success": True, "message": "Leave submitted", "leave_id": str(res.inserted_id)})
+    return jsonify({
+        "success": True,
+        "message": "Leave submitted",
+        "leave_id": str(res.inserted_id)
+    })
+
 
 # ---------------------------
-# List leave applications (admin view)
+# Admin: List all leave requests
 # ---------------------------
 @app.route("/leave/list", methods=["GET"])
 def list_leave():
@@ -994,15 +1005,17 @@ def list_leave():
         query["teacher_id"] = teacher_id.strip().rstrip(",")
 
     leaves = []
+
     for l in leave_col.find(query).sort("submitted_at", -1):
         t_id = l.get("teacher_id")
         session = l.get("session")
+
         teacher_name = "Unknown"
 
         if t_id:
             t_doc = get_teacher_doc(t_id, session)
             if t_doc:
-                teacher_name = t_doc.get("name", "Unknown")
+                teacher_name = t_doc.get("name", "Unknown").strip()
 
         leaves.append({
             "id": str(l["_id"]),
@@ -1021,8 +1034,9 @@ def list_leave():
 
     return jsonify({"success": True, "leaves": leaves})
 
+
 # ---------------------------
-# Approve / Reject leave (admin action)
+# Admin: Approve or Reject leave
 # ---------------------------
 @app.route("/leave/update-status/<leave_id>", methods=["POST"])
 def update_leave_status(leave_id):
@@ -1039,31 +1053,33 @@ def update_leave_status(leave_id):
     )
 
     if res.modified_count == 0:
-        return jsonify({"success": False, "message": "Leave not found or status unchanged"}), 404
+        return jsonify({"success": False, "message": "Leave not found"}), 404
 
     return jsonify({"success": True, "message": f"Leave {status} successfully"})
 
+
 # ---------------------------
-# Teacher view: list own leaves
+# Teacher: View own leave applications
 # ---------------------------
 @app.route("/leave/teacher/<teacher_id>", methods=["GET"])
 def teacher_leave_status(teacher_id):
     teacher_doc = get_teacher_doc(teacher_id)
+
     if not teacher_doc:
         return jsonify({"success": False, "message": "Teacher not found"}), 404
 
-    identifiers = [
+    ids = [
         str(teacher_doc["_id"]),
         teacher_doc.get("teacher_id"),
         teacher_doc.get("username")
     ]
 
     leaves = []
-    for l in leave_col.find({"teacher_id": {"$in": identifiers}}).sort("submitted_at", -1):
+    for l in leave_col.find({"teacher_id": {"$in": ids}}).sort("submitted_at", -1):
         leaves.append({
             "leave_id": str(l["_id"]),
             "teacher_id": l.get("teacher_id"),
-            "teacher_name": teacher_doc.get("name", "Unknown"),
+            "teacher_name": teacher_doc.get("name", "Unknown").strip(),
             "session": l.get("session"),
             "start_date": l.get("start_date"),
             "end_date": l.get("end_date"),
@@ -1075,8 +1091,9 @@ def teacher_leave_status(teacher_id):
 
     return jsonify({"success": True, "leaves": leaves})
 
+
 # ---------------------------
-# Get leave document
+# Download leave document
 # ---------------------------
 @app.route("/leave/get-document/<filename>")
 def get_leave_document(filename):
