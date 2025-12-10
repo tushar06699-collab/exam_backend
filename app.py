@@ -968,43 +968,34 @@ os.makedirs(LEAVE_DIR, exist_ok=True)
 # ---------------------------
 # Helper: Resolve teacher document reliably
 # ---------------------------
-# ---------------------------
-# Teacher lookup
-# ---------------------------
 def get_teacher_doc(tid, session=None):
 
     tid = str(tid).strip().rstrip(",")
     session = session.strip().rstrip(",") if session else None
 
-    # BEST MATCH → teacher_id + session
     if session:
         doc = teachers_col.find_one({"teacher_id": tid, "session": session})
         if doc:
             return doc
 
-    # Try match by username + session
     if session:
         doc = teachers_col.find_one({"username": tid, "session": session})
         if doc:
             return doc
 
-    # Match by ObjectId
     if ObjectId.is_valid(tid):
         doc = teachers_col.find_one({"_id": ObjectId(tid)})
         if doc:
             return doc
 
-    # FALLBACK MATCH → teacher_id (ANY session)
     doc = teachers_col.find_one({"teacher_id": tid})
     if doc:
         return doc
 
-    # FALLBACK MATCH → username (ANY session)
     doc = teachers_col.find_one({"username": tid})
     if doc:
         return doc
 
-    # Not found
     return None
 
 
@@ -1018,12 +1009,12 @@ def submit_leave():
     start_date = request.form.get("start_date")
     end_date = request.form.get("end_date")
     reason = request.form.get("reason")
-    file = request.files.get("document")  # optional file
+    purpose = request.form.get("purpose")   # ✅ ADDED
+    file = request.files.get("document")
 
-    if not all([teacher_id, session, start_date, end_date, reason]):
+    if not all([teacher_id, session, start_date, end_date, reason, purpose]):
         return jsonify({"success": False, "message": "Missing fields"}), 400
 
-    # Save document if uploaded
     filename = ""
     if file:
         filename = f"{datetime.utcnow().timestamp()}_{file.filename}"
@@ -1036,6 +1027,7 @@ def submit_leave():
         "start_date": start_date,
         "end_date": end_date,
         "reason": reason,
+        "purpose": purpose,   # ✅ ADDED
         "document": filename,
         "status": "pending",
         "submitted_at": datetime.utcnow(),
@@ -1072,22 +1064,13 @@ def list_leave():
         session = l.get("session")
 
         teacher_name = "Unknown"
-        t_doc = None  # FIX: ensure defined
+        t_doc = None
 
-        # ----------------------------
-        # Fetch teacher document
-        # ----------------------------
         if t_id and session:
-            print("DEBUG:", t_id, session)
             t_doc = get_teacher_doc(t_id, session)
-            print("FOUND TEACHER:", t_doc)
-
             if t_doc:
                 teacher_name = t_doc.get("name", "Unknown").strip()
 
-        # ----------------------------
-        # Build leave entry
-        # ----------------------------
         leaves.append({
             "id": str(l["_id"]),
             "teacher_id": t_id,
@@ -1096,6 +1079,7 @@ def list_leave():
             "start_date": l.get("start_date"),
             "end_date": l.get("end_date"),
             "reason": l.get("reason"),
+            "purpose": l.get("purpose", ""),   # ✅ ADDED
             "document": l.get("document", ""),
             "document_url": f"/leave/get-document/{l['document']}" if l.get("document") else "",
             "status": l.get("status"),
@@ -1155,6 +1139,7 @@ def teacher_leave_status(teacher_id):
             "start_date": l.get("start_date"),
             "end_date": l.get("end_date"),
             "reason": l.get("reason"),
+            "purpose": l.get("purpose", ""),  # ✅ ADDED
             "status": l.get("status"),
             "admin_message": l.get("admin_message", ""),
             "submitted_at": l.get("submitted_at").strftime("%Y-%m-%d %H:%M:%S")
