@@ -218,21 +218,39 @@ def get_datesheet():
     if not class_name or not session or not exam_name:
         return jsonify({"success": False, "message": "Missing parameters"}), 400
 
-    # 1) all subjects for class+session
-    subjects = [row.get("subject") for row in exam_subjects_col.find({"class_name": class_name, "session": session})]
+    # 1) Fetch exam info (time, total marks)
+    exam_doc = exams_col.find_one({"exam_name": exam_name, "session": session})
+    if not exam_doc:
+        return jsonify({"success": False, "message": "Exam not found"}), 404
 
-    # 2) datesheet entries
-    ds_cursor = datesheet_col.find({"class_name": class_name, "session": session, "exam_name": exam_name})
+    exam_time = exam_doc.get("exam_time", "")
+    total_marks = exam_doc.get("total_marks", "")
+
+    # 2) Fetch subjects for class + session
+    subjects = [row.get("subject") for row in exam_subjects_col.find({
+        "class_name": class_name,
+        "session": session
+    })]
+
+    # 3) Fetch datesheet entries
+    ds_cursor = datesheet_col.find({
+        "class_name": class_name,
+        "session": session,
+        "exam_name": exam_name
+    })
     date_map = {d.get("subject"): d.get("date") for d in ds_cursor}
 
+    # 4) Create final output
     final = []
     for sub in subjects:
         final.append({
             "subject": sub,
-            "date": date_map.get(sub, "")
+            "date": date_map.get(sub, ""),   # individual date
+            "total_marks": total_marks,       # same for all subjects
+            "duration": exam_time             # same for all subjects
         })
-    return jsonify({"success": True, "datesheet": final})
 
+    return jsonify({"success": True, "datesheet": final})
 # ---------------------------
 # debug datesheet (show collection's keys info)
 # ---------------------------
@@ -435,26 +453,47 @@ def add_teacher():
     password = data.get("password")
     name = data.get("name")
 
+    # Check missing fields
     if not session or not username or not password or not name:
         return jsonify({"success": False, "message": "Missing fields"}), 400
 
-    # Generate 4-digit teacher_id per session
-    last_teacher = teachers_col.find({"session": session}).sort("teacher_id", -1).limit(1)
-    try:
-        last_id = int(last_teacher[0]["teacher_id"]) if last_teacher.count() > 0 else 0
-    except:
-        last_id = 0
-    new_id = f"{last_id + 1:04d}"  # 4-digit string, e.g., "0001"
+    # Check if username already exists
+    if teachers_col.find_one({"username": username, "session": session}):
+        return jsonify({"success": False, "message": "Username already exists"}), 400
 
+    # -----------------------------
+    # AUTO-GENERATE 4-DIGIT TEACHER ID
+    # -----------------------------
+    last_teacher = teachers_col.find({"session": session}).sort("teacher_id", -1).limit(1)
+
+    last_id = 0
+    last_teacher = list(last_teacher)
+
+    if last_teacher:
+        try:
+            last_id = int(last_teacher[0]["teacher_id"])
+        except:
+            last_id = 0
+
+    new_teacher_id = f"{last_id + 1:04d}"  # e.g., "0001"
+
+    # -----------------------------
+    # INSERT TEACHER
+    # -----------------------------
     try:
         teachers_col.insert_one({
-            "teacher_id": new_id,
+            "teacher_id": new_teacher_id,
             "session": session,
             "username": username,
             "password": password,
             "name": name
         })
-        return jsonify({"success": True, "message": "Teacher added", "teacher_id": new_id})
+
+        return jsonify({
+            "success": True,
+            "message": "Teacher added successfully",
+            "teacher_id": new_teacher_id
+        })
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
 
@@ -476,7 +515,10 @@ def delete_teacher(teacher_id):
         obj = None
 
     # 1) Delete teacher
-    teachers_col.delete_one({"_id": ObjectId(teacher_id)})
+    try:
+        teachers_col.delete_one({"_id": ObjectId(teacher_id)})
+    except:
+        teachers_col.delete_one({"teacher_id": teacher_id})
 
     # 2) Delete ALL timetable rows (string or ObjectId stored)
     delete_filter = {"$or": [
@@ -634,32 +676,53 @@ def timetable_classwise():
     class_name = request.args.get("class_name")
 
     if not session or not class_name:
-        return jsonify({"success": False, "message": "Missing parameters", "timetable": []}), 400
+        return jsonify({
+            "success": False,
+            "message": "Missing parameters",
+            "timetable": []
+        }), 400
 
-    # find timetable docs where class matches
-    cursor = timetable_col.find({"session": session, "class": class_name}).sort("period", ASCENDING)
-    out = []
-    for r in cursor:
-        # fetch teacher name if teacher_id provided
+    # Fetch all rows for this class+session
+    cursor = timetable_col.find(
+        {"session": session, "class": class_name}
+    ).sort("period", ASCENDING)
+
+    output = []
+
+    for row in cursor:
+
+        # ------------- FETCH TEACHER NAME CORRECTLY -------------
         teacher_name = ""
-        t_id = r.get("teacher_id")
-        if t_id:
-            t_doc = teachers_col.find_one({"_id": ObjectId(t_id)}) if ObjectId.is_valid(str(t_id)) else teachers_col.find_one({"_id": t_id})
+        teacher_id = str(row.get("teacher_id", "")).strip()
+
+        if teacher_id:
+            # CASE 1: valid ObjectId
+            if ObjectId.is_valid(teacher_id):
+                t_doc = teachers_col.find_one({"_id": ObjectId(teacher_id)})
+            else:
+                # CASE 2: teacher_id stored as normal string
+                t_doc = teachers_col.find_one({"teacher_id": teacher_id})
+
             if t_doc:
                 teacher_name = t_doc.get("name", "")
-        out.append({
-            "period": r.get("period"),
-            "class": r.get("class"),
-            "Monday": f"{teacher_name} - {r.get('monday')}" if r.get("monday") else "",
-            "Tuesday": f"{teacher_name} - {r.get('tuesday')}" if r.get("tuesday") else "",
-            "Wednesday": f"{teacher_name} - {r.get('wednesday')}" if r.get("wednesday") else "",
-            "Thursday": f"{teacher_name} - {r.get('thursday')}" if r.get("thursday") else "",
-            "Friday": f"{teacher_name} - {r.get('friday')}" if r.get("friday") else "",
-            "Saturday": f"{teacher_name} - {r.get('saturday')}" if r.get("saturday") else "",
-            "startDay": int(r.get("startDay", 1)),
-            "endDay": int(r.get("endDay", 1))
+
+        # ------------- BUILD WEEKDAY ENTRIES -------------
+        output.append({
+            "period": row.get("period"),
+            "class": row.get("class"),
+
+            "Monday": f"{teacher_name} - {row.get('monday')}" if row.get("monday") else "",
+            "Tuesday": f"{teacher_name} - {row.get('tuesday')}" if row.get("tuesday") else "",
+            "Wednesday": f"{teacher_name} - {row.get('wednesday')}" if row.get("wednesday") else "",
+            "Thursday": f"{teacher_name} - {row.get('thursday')}" if row.get("thursday") else "",
+            "Friday": f"{teacher_name} - {row.get('friday')}" if row.get("friday") else "",
+            "Saturday": f"{teacher_name} - {row.get('saturday')}" if row.get("saturday") else "",
+
+            "startDay": int(row.get("startDay", 1)),
+            "endDay": int(row.get("endDay", 1))
         })
-    return jsonify({"success": True, "timetable": out})
+
+    return jsonify({"success": True, "timetable": output})
 
 # ---------------------------
 # Get used days for a class+period (/timetable/used_days)
@@ -1009,14 +1072,22 @@ def list_leave():
         session = l.get("session")
 
         teacher_name = "Unknown"
+        t_doc = None  # FIX: ensure defined
 
-        if t_id:
-                  print("DEBUG:", t_id, session)
-                  t_doc = get_teacher_doc(t_id, session)
-                  print("FOUND TEACHER:", t_doc)
-        if t_doc:
+        # ----------------------------
+        # Fetch teacher document
+        # ----------------------------
+        if t_id and session:
+            print("DEBUG:", t_id, session)
+            t_doc = get_teacher_doc(t_id, session)
+            print("FOUND TEACHER:", t_doc)
+
+            if t_doc:
                 teacher_name = t_doc.get("name", "Unknown").strip()
 
+        # ----------------------------
+        # Build leave entry
+        # ----------------------------
         leaves.append({
             "id": str(l["_id"]),
             "teacher_id": t_id,
