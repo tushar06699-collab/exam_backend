@@ -6,6 +6,8 @@ from flask_cors import CORS
 from pymongo import MongoClient, ASCENDING
 from bson.objectid import ObjectId
 from datetime import datetime
+from pymongo import MongoClient
+
 
 # ---------------------------
 # MongoDB connection
@@ -13,6 +15,16 @@ from datetime import datetime
 MONGO_URL = "mongodb+srv://myusere:mypassword123@cluster0.fpsihrb.mongodb.net/?appName=Cluster0"
 client = MongoClient(MONGO_URL)
 db = client["school_exam_db"]
+
+# --------------------------------------------------------
+# MongoDB (STUDENT DATABASE ONLY)
+# --------------------------------------------------------
+STUDENT_MONGO_URI = "mongodb+srv://school_students:Tushar2007@cluster0.upoywck.mongodb.net/school_erp?retryWrites=true&w=majority"
+
+student_client = MongoClient(STUDENT_MONGO_URI)
+student_db = student_client["school_erp"]
+students_col = student_db["students"]
+
 
 # Collections (mirror of your sqlite tables)
 exams_col = db["exams"]
@@ -604,7 +616,27 @@ def login():
                 "session": teacher.get("session")
             }
         })
+    # -------- STUDENT LOGIN (MONGODB) --------
+    student = students_col.find_one({
+        "admission_no": username,
+        "dob": password   # OR change to roll / mobile if needed
+    })
 
+    if student:
+        return jsonify({
+            "success": True,
+            "role": "student",
+            "token": f"student_{username}_token",
+            "student": {
+                "id": str(student["_id"]),
+                "name": student.get("student_name"),
+                "admission_no": student.get("admission_no"),
+                "class": student.get("class_name"),
+                "section": student.get("section"),
+                "session": student.get("session"),
+                "photo": student.get("photo_url", "")
+            }
+        })
     # ---------- INVALID LOGIN ----------
     return jsonify({"success": False, "message": "Invalid username or password"}), 401
 # ---------------------------
