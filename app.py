@@ -667,6 +667,7 @@ def login():
                 "id": str(student["_id"]),
                 "name": student.get("student_name"),
                 "admission_no": student.get("admission_no"),
+                "roll": student.get("rollno"),
                 "class": student.get("class_name"),
                 "section": student.get("section"),
                 "session": student.get("session"),
