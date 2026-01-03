@@ -1058,6 +1058,51 @@ def list_attendance():
 
     return jsonify({"success": True, "attendance": records})
 
+# =========================
+# HOLIDAY MANAGEMENT
+# =========================
+holiday_col = db["holidays"]
+
+@app.route("/holiday/add", methods=["POST"])
+def add_holiday():
+    data = request.json
+    name = data.get("name")
+    date = data.get("date")      # YYYY-MM-DD
+    session = data.get("session")
+
+    if not name or not date or not session:
+        return jsonify({"success": False, "message": "Missing fields"}), 400
+
+    holiday_col.insert_one({
+        "name": name,
+        "date": date,
+        "session": session,
+        "created_at": datetime.utcnow()
+    })
+    return jsonify({"success": True})
+
+
+@app.route("/holiday/list", methods=["GET"])
+def list_holidays():
+    session = request.args.get("session")
+    q = {"session": session} if session else {}
+
+    holidays = []
+    for h in holiday_col.find(q).sort("date", 1):
+        holidays.append({
+            "id": str(h["_id"]),
+            "name": h["name"],
+            "date": h["date"]
+        })
+
+    return jsonify({"success": True, "holidays": holidays})
+
+
+@app.route("/holiday/delete/<hid>", methods=["DELETE"])
+def delete_holiday(hid):
+    holiday_col.delete_one({"_id": ObjectId(hid)})
+    return jsonify({"success": True})
+
 # ---------------------------
 # Leave Applications Collection
 # ---------------------------
