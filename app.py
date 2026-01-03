@@ -898,43 +898,58 @@ os.makedirs(NOTICE_DIR, exist_ok=True)
 def upload_notice():
     title = request.form.get("title")
     description = request.form.get("description", "")
-    date = request.form.get("date")    # format: YYYY-MM-DD
+    date = request.form.get("date")        # YYYY-MM-DD
+    target = request.form.get("target")    # student | teacher | both
     file = request.files.get("pdf")
 
-    if not title or not date or not file:
-        return jsonify({"success": False, "message": "Missing fields"}), 400
+    if not title or not date:
+        return jsonify({"success": False, "message": "Title and date required"}), 400
 
-    try:
-        # Create file path
-        filename = f"{datetime.utcnow().timestamp()}_{file.filename}"
+    if target not in ["student", "teacher", "both"]:
+        target = "student"  # safe default
+
+    filename = None
+    if file:
+        filename = f"{int(datetime.utcnow().timestamp())}_{file.filename}"
         filepath = os.path.join(NOTICE_DIR, filename)
         file.save(filepath)
 
-        # Insert into Mongo
-        res = notices_col.insert_one({
-            "title": title,
-            "description": description,
-            "date": date,
-            "file": filename,
-            "uploaded_at": datetime.utcnow()
-        })
+    res = notices_col.insert_one({
+        "title": title,
+        "description": description,
+        "date": date,
+        "target": target,                # ✅ STORED
+        "file": filename,
+        "uploaded_at": datetime.utcnow()
+    })
 
-        return jsonify({"success": True, "message": "Notice uploaded", "id": str(res.inserted_id)})
-    
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
+    return jsonify({
+        "success": True,
+        "message": "Notice uploaded",
+        "id": str(res.inserted_id)
+    })
 @app.route("/notice/list", methods=["GET"])
 def list_notices():
+    role = request.args.get("role")  # student | teacher | None
+
+    query = {}
+    if role in ["student", "teacher"]:
+        query = {
+            "target": {"$in": [role, "both"]}
+        }
+
     notices = []
-    for n in notices_col.find().sort("uploaded_at", -1):
+    for n in notices_col.find(query).sort("uploaded_at", -1):
         notices.append({
             "id": str(n["_id"]),
             "title": n.get("title"),
             "description": n.get("description"),
             "date": n.get("date"),
+            "target": n.get("target", "student"),
             "file": n.get("file"),
-            "url": f"/notice/get-file/{n.get('file')}"
+            "url": f"/notice/get-file/{n.get('file')}" if n.get("file") else None
         })
+
     return jsonify({"success": True, "notices": notices})
 @app.route("/notice/get-file/<filename>")
 def get_notice_file(filename):
@@ -949,14 +964,15 @@ def delete_notice(notice_id):
         if not doc:
             return jsonify({"success": False, "message": "Notice not found"}), 404
 
-        # delete file
-        filepath = os.path.join(NOTICE_DIR, doc["file"])
-        if os.path.exists(filepath):
-            os.remove(filepath)
+        if doc.get("file"):
+            filepath = os.path.join(NOTICE_DIR, doc["file"])
+            if os.path.exists(filepath):
+                os.remove(filepath)
 
         notices_col.delete_one({"_id": ObjectId(notice_id)})
+
         return jsonify({"success": True, "message": "Notice deleted"})
-    
+
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
 
