@@ -263,6 +263,42 @@ def get_datesheet():
         })
 
     return jsonify({"success": True, "datesheet": final})
+
+@app.route("/portal/student/<student_id>", methods=["GET"])
+def portal_get_student(student_id):
+    try:
+        student = students_col.find_one({"_id": ObjectId(student_id)})
+        if not student:
+            return jsonify({"success": False, "message": "Student not found"}), 404
+
+        return jsonify({
+            "success": True,
+            "student": {
+                "id": str(student["_id"]),
+                "name": student.get("student_name"),
+                "class_name": student.get("class_name"),
+                "section": student.get("section"),
+                "roll": student.get("rollno"),
+                "photo_url": student.get("photo_url", "")
+            }
+        })
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+@app.route("/portal/students", methods=["GET"])
+def portal_list_students():
+    students = []
+    for s in students_col.find():
+        students.append({
+            "id": str(s["_id"]),
+            "name": s.get("student_name"),
+            "class_name": s.get("class_name"),
+            "section": s.get("section"),
+            "roll": s.get("rollno"),
+            "photo_url": s.get("photo_url", "")
+        })
+    return jsonify({"success": True, "students": students})
+
 # ---------------------------
 # debug datesheet (show collection's keys info)
 # ---------------------------
