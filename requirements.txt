@@ -1,4 +1,9 @@
-Flask
-Flask-Cors
+flask
+flask-cors
 pymongo
+cloudinary
+python-dotenv
+pandas
+openpyxl
+dnspython
 gunicorn

@@ -34,6 +34,10 @@ exam_marks_col = db["exam_marks"]
 class_incharge_col = db["class_incharge"]
 teachers_col = db["teachers"]
 timetable_col = db["timetable"]
+internal_marks_col = db["internal_marks"]
+internal_config_col = db["internal_config"]
+result_publish_col = db["result_publish"]
+exam_subject_config_col = db["exam_subject_config"]
 
 # Create useful indexes to emulate UNIQUE constraints where used in sqlite
 # Note: index creation is idempotent
@@ -44,6 +48,26 @@ exam_marks_col.create_index([("session", ASCENDING), ("exam_id", ASCENDING), ("c
 class_incharge_col.create_index([("session", ASCENDING), ("class_name", ASCENDING)], unique=True)
 teachers_col.create_index([("session", ASCENDING), ("username", ASCENDING)], unique=True)
 timetable_col.create_index([("session", ASCENDING), ("teacher_id", ASCENDING), ("period", ASCENDING), ("class", ASCENDING)])
+_internal_marks_index_old = "session_1_class_name_1_subject_1_student_id_1"
+_internal_marks_index_new = "session_1_class_name_1_subject_1_exam_name_1_student_id_1"
+try:
+    existing_indexes = internal_marks_col.index_information()
+    if _internal_marks_index_old in existing_indexes:
+        internal_marks_col.drop_index(_internal_marks_index_old)
+except Exception:
+    # Avoid startup crash if index drop fails; app can still run.
+    pass
+internal_marks_col.create_index(
+    [("session", ASCENDING), ("class_name", ASCENDING), ("subject", ASCENDING), ("exam_name", ASCENDING), ("student_id", ASCENDING)],
+    unique=True,
+    name=_internal_marks_index_new
+)
+internal_config_col.create_index([("session", ASCENDING), ("class_name", ASCENDING), ("subject", ASCENDING)], unique=True)
+result_publish_col.create_index([("session", ASCENDING), ("class_name", ASCENDING), ("exam_name", ASCENDING)], unique=True)
+exam_subject_config_col.create_index(
+    [("session", ASCENDING), ("class_name", ASCENDING), ("exam_name", ASCENDING), ("subject", ASCENDING)],
+    unique=True
+)
 
 # ---------------------------
 # Flask app + uploads folder
@@ -74,15 +98,25 @@ def create_exam():
     session = data.get("session")
     exam_time = data.get("exam_time")
     total_marks = data.get("total_marks")
+    internal_marks = data.get("internal_marks")
 
     if not exam_name or not session or not exam_time or total_marks is None:
         return jsonify({"success": False, "message": "Missing fields"}), 400
+
+    # Default to True for backward compatibility if not provided
+    if internal_marks is None:
+        internal_marks = True
+    # Normalize to boolean
+    if isinstance(internal_marks, str):
+        internal_marks = internal_marks.strip().lower() in ["1", "true", "yes"]
+    internal_marks = bool(internal_marks)
 
     doc = {
         "exam_name": exam_name,
         "session": session,
         "exam_time": exam_time,
         "total_marks": int(total_marks),
+        "internal_marks": internal_marks,
         "created_at": datetime.utcnow()
     }
     res = exams_col.insert_one(doc)
@@ -129,7 +163,8 @@ def list_all_exams():
                 "exam_name": ex.get("exam_name"),
                 "session": ex.get("session"),
                 "exam_time": ex.get("exam_time"),
-                "total_marks": ex.get("total_marks")
+                "total_marks": ex.get("total_marks"),
+                "internal_marks": ex.get("internal_marks", False)
             })
         return jsonify({"success": True, "exams": rows})
     except Exception as e:
@@ -467,6 +502,309 @@ def get_marks():
             "marks": row.get("marks")
         })
     return jsonify({"success": True, "marks": marks})
+
+# ---------------------------
+# Save internal marks (upsert)
+# ---------------------------
+@app.route("/internal-marks/save", methods=["POST"])
+def save_internal_marks():
+    data = request.get_json() or {}
+    session = data.get("session")
+    class_name = data.get("class_name")
+    subject = data.get("subject")
+    exam_name = data.get("exam_name")
+    marks_list = data.get("marks", [])
+    teacher_id = data.get("teacher_id", "")
+
+    if not session or not class_name or not subject or not exam_name or not marks_list:
+        return jsonify({"success": False, "message": "Missing data"}), 400
+
+    try:
+        for item in marks_list:
+            student_id = item.get("student_id")
+            student_name = item.get("student_name")
+            marks_value = item.get("marks")
+            if not student_id or not student_name or marks_value is None:
+                continue
+
+            internal_marks_col.update_one(
+                {
+                    "session": session,
+                    "class_name": class_name,
+                    "subject": subject,
+                    "exam_name": exam_name,
+                    "student_id": student_id
+                },
+                {
+                    "$set": {
+                        "student_name": student_name,
+                        "marks": int(marks_value),
+                        "teacher_id": teacher_id,
+                        "exam_name": exam_name,
+                        "updated_at": datetime.utcnow()
+                    }
+                },
+                upsert=True
+            )
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "message": f"Failed to save internal marks: {str(e)}"
+        }), 500
+
+    return jsonify({"success": True, "message": "Internal marks saved successfully"})
+
+# ---------------------------
+# Get internal marks
+# ---------------------------
+@app.route("/internal-marks/list", methods=["GET"])
+def list_internal_marks():
+    session = request.args.get("session")
+    class_name = request.args.get("class_name")
+    subject = request.args.get("subject")
+    exam_name = request.args.get("exam_name")
+
+    if not session or not class_name or not subject or not exam_name:
+        return jsonify({"success": False, "message": "Missing parameters", "marks": []}), 400
+
+    cursor = internal_marks_col.find({
+        "session": session,
+        "class_name": class_name,
+        "subject": subject,
+        "exam_name": exam_name
+    }).sort("student_name", ASCENDING)
+
+    marks = []
+    for row in cursor:
+        marks.append({
+            "student_id": row.get("student_id"),
+            "student_name": row.get("student_name"),
+            "marks": row.get("marks"),
+            "teacher_id": row.get("teacher_id", "")
+        })
+
+    return jsonify({"success": True, "marks": marks})
+
+# ---------------------------
+# Get internal marks subjects for class+session+exam
+# ---------------------------
+@app.route("/internal-marks/subjects", methods=["GET"])
+def list_internal_subjects():
+    session = request.args.get("session")
+    class_name = request.args.get("class_name")
+    exam_name = request.args.get("exam_name")
+
+    if not session or not class_name or not exam_name:
+        return jsonify({"success": False, "message": "Missing parameters", "subjects": []}), 400
+
+    try:
+        subjects = internal_marks_col.distinct("subject", {
+            "session": session,
+            "class_name": class_name,
+            "exam_name": exam_name
+        })
+        subjects = [s for s in subjects if s]
+        return jsonify({"success": True, "subjects": subjects})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e), "subjects": []}), 500
+
+# ---------------------------
+# Publish/Unpublish Results
+# ---------------------------
+@app.route("/result/publish", methods=["POST"])
+def publish_result():
+    data = request.get_json() or {}
+    session = data.get("session")
+    class_name = data.get("class_name")
+    exam_name = data.get("exam_name")
+    published = data.get("published")
+
+    if not session or not class_name or not exam_name or published is None:
+        return jsonify({"success": False, "message": "Missing data"}), 400
+
+    if isinstance(published, str):
+        published = published.strip().lower() in ["1", "true", "yes"]
+    published = bool(published)
+
+    result_publish_col.update_one(
+        {"session": session, "class_name": class_name, "exam_name": exam_name},
+        {"$set": {"published": published, "updated_at": datetime.utcnow()}},
+        upsert=True
+    )
+    return jsonify({"success": True, "published": published})
+
+@app.route("/result/status", methods=["GET"])
+def result_status():
+    session = request.args.get("session")
+    class_name = request.args.get("class_name")
+    exam_name = request.args.get("exam_name")
+
+    if not session or not class_name or not exam_name:
+        return jsonify({"success": False, "message": "Missing parameters"}), 400
+
+    doc = result_publish_col.find_one({
+        "session": session,
+        "class_name": class_name,
+        "exam_name": exam_name
+    })
+    published = bool(doc.get("published")) if doc else False
+    return jsonify({"success": True, "published": published})
+
+# ---------------------------
+# Save internal marks config (max/weightage) per subject
+# ---------------------------
+@app.route("/internal-config/save", methods=["POST"])
+def save_internal_config():
+    data = request.get_json() or {}
+    session = data.get("session")
+    class_name = data.get("class_name")
+    subject = data.get("subject")
+    max_marks = data.get("max_marks")
+    weightage = data.get("weightage")
+
+    if not session or not class_name or not subject:
+        return jsonify({"success": False, "message": "Missing data"}), 400
+
+    if max_marks is None and weightage is None:
+        return jsonify({"success": False, "message": "Provide max_marks or weightage"}), 400
+
+    update = {"updated_at": datetime.utcnow()}
+    if max_marks is not None:
+        update["max_marks"] = float(max_marks)
+    if weightage is not None:
+        update["weightage"] = float(weightage)
+
+    internal_config_col.update_one(
+        {"session": session, "class_name": class_name, "subject": subject},
+        {"$set": update},
+        upsert=True
+    )
+
+    return jsonify({"success": True, "message": "Internal config saved"})
+
+# ---------------------------
+# Get internal marks config per subject
+# ---------------------------
+@app.route("/internal-config/get", methods=["GET"])
+def get_internal_config():
+    session = request.args.get("session")
+    class_name = request.args.get("class_name")
+    subject = request.args.get("subject")
+
+    if not session or not class_name or not subject:
+        return jsonify({"success": False, "message": "Missing parameters"}), 400
+
+    doc = internal_config_col.find_one({
+        "session": session,
+        "class_name": class_name,
+        "subject": subject
+    })
+
+    if not doc:
+        return jsonify({
+            "success": True,
+            "config": {"session": session, "class_name": class_name, "subject": subject}
+        })
+
+    return jsonify({
+        "success": True,
+        "config": {
+            "session": session,
+            "class_name": class_name,
+            "subject": subject,
+            "max_marks": doc.get("max_marks"),
+            "weightage": doc.get("weightage")
+        }
+    })
+
+# ---------------------------
+# Save per-exam subject marks config (external/internal)
+# ---------------------------
+@app.route("/exam/subject-config/save", methods=["POST"])
+def save_exam_subject_config():
+    data = request.get_json() or {}
+    session = data.get("session")
+    class_name = data.get("class_name")
+    exam_name = data.get("exam_name")
+    subject = data.get("subject")
+    external_max_marks = data.get("external_max_marks")
+    internal_max_marks = data.get("internal_max_marks")
+
+    if not session or not class_name or not exam_name or not subject:
+        return jsonify({"success": False, "message": "Missing data"}), 400
+
+    if external_max_marks is None and internal_max_marks is None:
+        return jsonify({"success": False, "message": "Provide external_max_marks or internal_max_marks"}), 400
+
+    update = {"updated_at": datetime.utcnow()}
+    if external_max_marks is not None:
+        update["external_max_marks"] = float(external_max_marks)
+    if internal_max_marks is not None:
+        update["internal_max_marks"] = float(internal_max_marks)
+
+    exam_subject_config_col.update_one(
+        {
+            "session": session,
+            "class_name": class_name,
+            "exam_name": exam_name,
+            "subject": subject
+        },
+        {"$set": update},
+        upsert=True
+    )
+
+    # Keep existing internal-config flow working with latest entered internal max.
+    if internal_max_marks is not None:
+        internal_config_col.update_one(
+            {"session": session, "class_name": class_name, "subject": subject},
+            {"$set": {"max_marks": float(internal_max_marks), "updated_at": datetime.utcnow()}},
+            upsert=True
+        )
+
+    return jsonify({"success": True, "message": "Subject marks config saved"})
+
+# ---------------------------
+# Get per-exam subject marks config
+# ---------------------------
+@app.route("/exam/subject-config/get", methods=["GET"])
+def get_exam_subject_config():
+    session = request.args.get("session")
+    class_name = request.args.get("class_name")
+    exam_name = request.args.get("exam_name")
+    subject = request.args.get("subject")
+
+    if not session or not class_name or not exam_name or not subject:
+        return jsonify({"success": False, "message": "Missing parameters"}), 400
+
+    doc = exam_subject_config_col.find_one({
+        "session": session,
+        "class_name": class_name,
+        "exam_name": exam_name,
+        "subject": subject
+    })
+
+    # Fallbacks for backward compatibility
+    exam_doc = exams_col.find_one({"session": session, "exam_name": exam_name}) or {}
+    internal_doc = internal_config_col.find_one({
+        "session": session,
+        "class_name": class_name,
+        "subject": subject
+    }) or {}
+
+    external_fallback = exam_doc.get("total_marks")
+    internal_fallback = internal_doc.get("max_marks")
+
+    return jsonify({
+        "success": True,
+        "config": {
+            "session": session,
+            "class_name": class_name,
+            "exam_name": exam_name,
+            "subject": subject,
+            "external_max_marks": (doc.get("external_max_marks") if doc else external_fallback),
+            "internal_max_marks": (doc.get("internal_max_marks") if doc else internal_fallback)
+        }
+    })
 # PART 3/4
 # ---------------------------
 # Get exam details by session + exam name
