@@ -38,6 +38,7 @@ internal_marks_col = db["internal_marks"]
 internal_config_col = db["internal_config"]
 result_publish_col = db["result_publish"]
 exam_subject_config_col = db["exam_subject_config"]
+student_access_col = db["student_exam_access"]
 
 # Create useful indexes to emulate UNIQUE constraints where used in sqlite
 # Note: index creation is idempotent
@@ -68,6 +69,10 @@ exam_subject_config_col.create_index(
     [("session", ASCENDING), ("class_name", ASCENDING), ("exam_name", ASCENDING), ("subject", ASCENDING)],
     unique=True
 )
+student_access_col.create_index(
+    [("session", ASCENDING), ("class_name", ASCENDING), ("student_id", ASCENDING)],
+    unique=True
+)
 
 # ---------------------------
 # Flask app + uploads folder
@@ -87,6 +92,78 @@ def id_str(doc):
         doc["id"] = str(doc["_id"])
         del doc["_id"]
     return doc
+
+def to_bool(value, default=True):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in ["1", "true", "yes", "y"]
+    return default
+
+def session_variants(session_value):
+    s = str(session_value or "").strip()
+    if not s:
+        return []
+    alt = s.replace("_", "-") if "_" in s else s.replace("-", "_")
+    if alt == s:
+        return [s]
+    return [s, alt]
+
+def normalize_student_id(raw):
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw.strip()
+    if isinstance(raw, dict):
+        if isinstance(raw.get("$oid"), str):
+            return raw.get("$oid").strip()
+        if isinstance(raw.get("oid"), str):
+            return raw.get("oid").strip()
+        if isinstance(raw.get("id"), str):
+            return raw.get("id").strip()
+    try:
+        return str(raw).strip()
+    except Exception:
+        return ""
+
+def get_student_access_flags(student_doc):
+    session = student_doc.get("session", "")
+    class_name = student_doc.get("class_name", "")
+    student_id = str(student_doc.get("_id", ""))
+
+    access_doc = None
+    if class_name and student_id:
+        sessions = session_variants(session)
+        if sessions:
+            access_doc = student_access_col.find_one({
+                "session": {"$in": sessions},
+                "class_name": class_name,
+                "student_id": student_id
+            })
+        else:
+            access_doc = student_access_col.find_one({
+                "class_name": class_name,
+                "student_id": student_id
+            })
+
+    eligible = to_bool(access_doc.get("eligible"), True) if access_doc else True
+    release_rollno = to_bool(access_doc.get("release_rollno"), True) if access_doc else True
+    release_result = to_bool(access_doc.get("release_result"), True) if access_doc else True
+
+    # Business rule: non-eligible students cannot have roll/result released.
+    if not eligible:
+        release_rollno = False
+        release_result = False
+
+    return {
+        "eligible": eligible,
+        "release_rollno": release_rollno,
+        "release_result": release_result
+    }
 
 # ---------------------------
 # Create exam (equivalent to /exam/create)
@@ -306,15 +383,24 @@ def portal_get_student(student_id):
         if not student:
             return jsonify({"success": False, "message": "Student not found"}), 404
 
+        access = get_student_access_flags(student)
+        roll_value = student.get("rollno") if access.get("release_rollno") else ""
+
         return jsonify({
             "success": True,
             "student": {
                 "id": str(student["_id"]),
                 "name": student.get("student_name"),
+                "admission_no": student.get("admission_no", ""),
                 "class_name": student.get("class_name"),
                 "section": student.get("section"),
-                "roll": student.get("rollno"),
-                "photo_url": student.get("photo_url", "")
+                "roll": roll_value,
+                "photo_url": student.get("photo_url", ""),
+                "session": student.get("session"),
+                "father_name": student.get("father_name", ""),
+                "eligible": access.get("eligible", True),
+                "release_rollno": access.get("release_rollno", True),
+                "release_result": access.get("release_result", True)
             }
         })
     except Exception as e:
@@ -324,15 +410,119 @@ def portal_get_student(student_id):
 def portal_list_students():
     students = []
     for s in students_col.find():
+        access = get_student_access_flags(s)
+        roll_value = s.get("rollno") if access.get("release_rollno") else ""
         students.append({
             "id": str(s["_id"]),
             "name": s.get("student_name"),
+            "admission_no": s.get("admission_no", ""),
             "class_name": s.get("class_name"),
             "section": s.get("section"),
-            "roll": s.get("rollno"),
-            "photo_url": s.get("photo_url", "")
+            "roll": roll_value,
+            "photo_url": s.get("photo_url", ""),
+            "session": s.get("session"),
+            "eligible": access.get("eligible", True),
+            "release_rollno": access.get("release_rollno", True),
+            "release_result": access.get("release_result", True)
         })
     return jsonify({"success": True, "students": students})
+
+@app.route("/student-access/list", methods=["GET"])
+def student_access_list():
+    session = request.args.get("session")
+    class_name = request.args.get("class_name")
+    if not session or not class_name:
+        return jsonify({"success": False, "message": "Missing parameters", "students": []}), 400
+
+    sessions = session_variants(session)
+
+    students = list(students_col.find({
+        "session": {"$in": sessions},
+        "class_name": class_name
+    }))
+    if not students:
+        students = list(students_col.find({"class_name": class_name}))
+
+    setting_docs = list(student_access_col.find({
+        "session": {"$in": sessions},
+        "class_name": class_name
+    }))
+    setting_map = {}
+    for doc in setting_docs:
+        sid = doc.get("student_id")
+        if sid and sid not in setting_map:
+            setting_map[sid] = doc
+
+    def roll_num(s):
+        try:
+            return int(str(s.get("rollno", "")).strip())
+        except Exception:
+            return 10**9
+
+    students.sort(key=roll_num)
+    out = []
+    for s in students:
+        sid = str(s.get("_id"))
+        setting = setting_map.get(sid, {})
+
+        eligible = to_bool(setting.get("eligible"), True)
+        release_rollno = to_bool(setting.get("release_rollno"), True)
+        release_result = to_bool(setting.get("release_result"), True)
+        if not eligible:
+            release_rollno = False
+            release_result = False
+
+        out.append({
+            "student_id": sid,
+            "name": s.get("student_name", ""),
+            "father_name": s.get("father_name", ""),
+            "class_name": s.get("class_name", ""),
+            "rollno": s.get("rollno", ""),
+            "eligible": eligible,
+            "release_rollno": release_rollno,
+            "release_result": release_result
+        })
+
+    return jsonify({"success": True, "students": out})
+
+@app.route("/student-access/save", methods=["POST"])
+def student_access_save():
+    data = request.get_json() or {}
+    session = data.get("session")
+    class_name = data.get("class_name")
+    students = data.get("students", [])
+
+    if not session or not class_name or not isinstance(students, list):
+        return jsonify({"success": False, "message": "Missing data"}), 400
+
+    sessions = session_variants(session)
+    saved = 0
+    for row in students:
+        sid = str(row.get("student_id", "")).strip()
+        if not sid:
+            continue
+
+        eligible = to_bool(row.get("eligible"), True)
+        release_rollno = to_bool(row.get("release_rollno"), True)
+        release_result = to_bool(row.get("release_result"), True)
+        if not eligible:
+            release_rollno = False
+            release_result = False
+
+        for sess in sessions:
+            student_access_col.update_one(
+                {"session": sess, "class_name": class_name, "student_id": sid},
+                {"$set": {
+                    "eligible": eligible,
+                    "release_rollno": release_rollno,
+                    "release_result": release_result,
+                    "updated_at": datetime.utcnow()
+                }},
+                upsert=True
+            )
+        saved += 1
+
+    return jsonify({"success": True, "message": "Student access settings saved", "saved": saved})
 
 # ---------------------------
 # debug datesheet (show collection's keys info)
@@ -997,6 +1187,8 @@ def login():
     })
 
     if student:
+        access = get_student_access_flags(student)
+        roll_value = student.get("rollno") if access.get("release_rollno") else ""
         return jsonify({
             "success": True,
             "role": "student",
@@ -1005,11 +1197,14 @@ def login():
                 "id": str(student["_id"]),
                 "name": student.get("student_name"),
                 "admission_no": student.get("admission_no"),
-                "rollno": student.get("rollno"),
+                "rollno": roll_value,
                 "class": student.get("class_name"),
                 "section": student.get("section"),
                 "session": student.get("session"),
-                "photo": student.get("photo_url", "")
+                "photo": student.get("photo_url", ""),
+                "eligible": access.get("eligible", True),
+                "release_rollno": access.get("release_rollno", True),
+                "release_result": access.get("release_result", True)
             }
         })
     # ---------- INVALID LOGIN ----------
@@ -1352,7 +1547,8 @@ def save_attendance():
     # Insert new attendance
     to_insert = []
     for att in attendance_list:
-        student_id = att.get("student_id")
+        student_id = normalize_student_id(att.get("student_id"))
+        student_roll = att.get("student_roll")
         status = att.get("status")
         if student_id and status in ["present", "absent", "leave"]:
             to_insert.append({
@@ -1360,6 +1556,7 @@ def save_attendance():
                 "class_name": class_name,
                 "date": date,
                 "student_id": student_id,
+                "student_roll": str(student_roll or "").strip(),
                 "status": status
             })
 
@@ -1389,8 +1586,10 @@ def list_attendance():
     cursor = attendance_col.find({"session": session, "class_name": class_name, "date": date})
     records = []
     for att in cursor:
+        sid = normalize_student_id(att.get("student_id"))
         records.append({
-            "student_id": att.get("student_id"),
+            "student_id": sid,
+            "student_roll": att.get("student_roll", ""),
             "status": att.get("status")
         })
 
