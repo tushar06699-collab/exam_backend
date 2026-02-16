@@ -130,6 +130,16 @@ def normalize_student_id(raw):
     except Exception:
         return ""
 
+
+
+def get_student_photo_url(student_doc):
+    if not student_doc:
+        return ""
+    for key in ["photo_url", "photo", "image_url", "profile_photo", "avatar"]:
+        value = str(student_doc.get(key, "") or "").strip()
+        if value and value.lower() not in ["nan", "null", "none"]:
+            return value
+    return ""
 def get_student_access_flags(student_doc):
     session = student_doc.get("session", "")
     class_name = student_doc.get("class_name", "")
@@ -379,7 +389,20 @@ def get_datesheet():
 @app.route("/portal/student/<student_id>", methods=["GET"])
 def portal_get_student(student_id):
     try:
-        student = students_col.find_one({"_id": ObjectId(student_id)})
+        student = None
+
+        # Primary lookup by ObjectId
+        try:
+            student = students_col.find_one({"_id": ObjectId(student_id)})
+        except Exception:
+            student = None
+
+        # Fallback lookup for older frontend sessions that stored admission_no in student_id
+        if not student:
+            sid = str(student_id or "").strip()
+            if sid:
+                student = students_col.find_one({"admission_no": sid})
+
         if not student:
             return jsonify({"success": False, "message": "Student not found"}), 404
 
@@ -395,7 +418,7 @@ def portal_get_student(student_id):
                 "class_name": student.get("class_name"),
                 "section": student.get("section"),
                 "roll": roll_value,
-                "photo_url": student.get("photo_url", ""),
+                "photo_url": get_student_photo_url(student),
                 "session": student.get("session"),
                 "father_name": student.get("father_name", ""),
                 "eligible": access.get("eligible", True),
@@ -419,7 +442,7 @@ def portal_list_students():
             "class_name": s.get("class_name"),
             "section": s.get("section"),
             "roll": roll_value,
-            "photo_url": s.get("photo_url", ""),
+            "photo_url": get_student_photo_url(s),
             "session": s.get("session"),
             "eligible": access.get("eligible", True),
             "release_rollno": access.get("release_rollno", True),
@@ -1201,7 +1224,7 @@ def login():
                 "class": student.get("class_name"),
                 "section": student.get("section"),
                 "session": student.get("session"),
-                "photo": student.get("photo_url", ""),
+                "photo": get_student_photo_url(student),
                 "eligible": access.get("eligible", True),
                 "release_rollno": access.get("release_rollno", True),
                 "release_result": access.get("release_result", True)
@@ -1513,6 +1536,7 @@ def delete_notice(notice_id):
 # Attendance collection
 # ---------------------------
 attendance_col = db["attendance"]
+attendance_col.create_index([("session", ASCENDING), ("class_name", ASCENDING), ("date", ASCENDING)])
 
 # ---------------------------
 # Add or update attendance
@@ -1590,6 +1614,46 @@ def list_attendance():
         records.append({
             "student_id": sid,
             "student_roll": att.get("student_roll", ""),
+            "status": att.get("status")
+        })
+
+    return jsonify({"success": True, "attendance": records})
+
+# ---------------------------
+# Get monthly attendance for class (fast path)
+# ---------------------------
+@app.route("/attendance/list-monthly", methods=["GET"])
+def list_attendance_monthly():
+    """
+    Query params:
+        session=2025_26
+        class_name=11th Arts
+        month=2026-02
+    """
+    session = request.args.get("session")
+    class_name = request.args.get("class_name")
+    month = request.args.get("month")  # YYYY-MM
+
+    if not session or not class_name or not month:
+        return jsonify({"success": False, "attendance": [], "message": "Missing parameters"}), 400
+
+    month = str(month).strip()
+    if len(month) != 7 or month[4] != "-":
+        return jsonify({"success": False, "attendance": [], "message": "Invalid month format"}), 400
+
+    cursor = attendance_col.find({
+        "session": session,
+        "class_name": class_name,
+        "date": {"$regex": f"^{month}-"}
+    })
+
+    records = []
+    for att in cursor:
+        sid = normalize_student_id(att.get("student_id"))
+        records.append({
+            "date": att.get("date"),
+            "student_id": sid,
+            "student_roll": str(att.get("student_roll", "")).strip(),
             "status": att.get("status")
         })
 
