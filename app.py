@@ -1201,7 +1201,7 @@ def login():
                 "class": student.get("class_name"),
                 "section": student.get("section"),
                 "session": student.get("session"),
-                "photo": student.get("photo_url", ""),
+                "photo_url": student.get("photo_url", ""),
                 "eligible": access.get("eligible", True),
                 "release_rollno": access.get("release_rollno", True),
                 "release_result": access.get("release_result", True)
@@ -1841,9 +1841,8 @@ def get_leave_document(filename):
         return send_file(filepath)
     return "File Not Found", 404
 
-# ---------------------------
-# Run app
-# ---------------------------
+import os
+
 if __name__ == "__main__":
-    # For local testing across devices, listen on 0.0.0.0
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
