@@ -1025,9 +1025,10 @@ def get_exam_details(session, exam_name):
 def add_teacher():
     data = request.json or {}
     session = data.get("session")
-    username = data.get("username")
+    username = str(data.get("username", "")).strip().upper()
     password = data.get("password")
     name = data.get("name")
+    req_teacher_id = str(data.get("teacher_id", "")).strip()
 
     # Check missing fields
     if not session or not username or not password or not name:
@@ -1038,20 +1039,24 @@ def add_teacher():
         return jsonify({"success": False, "message": "Username already exists"}), 400
 
     # -----------------------------
-    # AUTO-GENERATE 4-DIGIT TEACHER ID
+    # USE PROVIDED TEACHER ID (IF VALID) ELSE AUTO-GENERATE
     # -----------------------------
-    last_teacher = teachers_col.find({"session": session}).sort("teacher_id", -1).limit(1)
+    new_teacher_id = ""
+    if req_teacher_id and req_teacher_id.isdigit() and len(req_teacher_id) == 4:
+        exists = teachers_col.find_one({"session": session, "teacher_id": req_teacher_id})
+        if not exists:
+            new_teacher_id = req_teacher_id
 
-    last_id = 0
-    last_teacher = list(last_teacher)
-
-    if last_teacher:
-        try:
-            last_id = int(last_teacher[0]["teacher_id"])
-        except:
-            last_id = 0
-
-    new_teacher_id = f"{last_id + 1:04d}"  # e.g., "0001"
+    if not new_teacher_id:
+        last_teacher = teachers_col.find({"session": session}).sort("teacher_id", -1).limit(1)
+        last_id = 0
+        last_teacher = list(last_teacher)
+        if last_teacher:
+            try:
+                last_id = int(last_teacher[0]["teacher_id"])
+            except:
+                last_id = 0
+        new_teacher_id = f"{last_id + 1:04d}"  # e.g., "0001"
 
     # -----------------------------
     # INSERT TEACHER
@@ -1134,13 +1139,61 @@ def get_teacher(teacher_id):
         })
     else:
         return jsonify({"error": "Teacher not found"}), 404
+
+@app.route("/teacher/reset-password/<teacher_id>", methods=["PUT"])
+def reset_teacher_password(teacher_id):
+    data = request.json or {}
+    new_password = str(data.get("password", "")).strip()
+
+    if not new_password:
+        return jsonify({"success": False, "message": "Password is required"}), 400
+
+    teacher = None
+    try:
+        teacher = teachers_col.find_one({"_id": ObjectId(teacher_id)})
+    except Exception:
+        teacher = None
+
+    if not teacher:
+        teacher = teachers_col.find_one({"teacher_id": teacher_id})
+
+    if not teacher:
+        return jsonify({"success": False, "message": "Teacher not found"}), 404
+
+    teachers_col.update_one({"_id": teacher["_id"]}, {"$set": {"password": new_password}})
+    return jsonify({"success": True, "message": "Password updated"})
+
+@app.route("/teacher/reset-password", methods=["PUT"])
+def reset_teacher_password_by_identity():
+    data = request.json or {}
+    new_password = str(data.get("password", "")).strip()
+    username = str(data.get("username", "")).strip().upper()
+    session = str(data.get("session", "")).strip()
+    teacher_id = str(data.get("teacher_id", "")).strip()
+
+    if not new_password:
+        return jsonify({"success": False, "message": "Password is required"}), 400
+
+    teacher = None
+    if username and session:
+        teacher = teachers_col.find_one({"username": username, "session": session})
+    if (not teacher) and teacher_id:
+        teacher = teachers_col.find_one({"teacher_id": teacher_id})
+    if (not teacher) and username:
+        teacher = teachers_col.find_one({"username": username})
+
+    if not teacher:
+        return jsonify({"success": False, "message": "Teacher not found"}), 404
+
+    teachers_col.update_one({"_id": teacher["_id"]}, {"$set": {"password": new_password}})
+    return jsonify({"success": True, "message": "Password updated"})
 # ---------------------------
 # Login (admin + teacher)
 # ---------------------------
 @app.route("/login", methods=["POST"])
 def login():
     data = request.json or {}
-    username = data.get("username")
+    username = str(data.get("username", "")).strip()
     password = data.get("password")
 
     if not username or not password:
@@ -1167,12 +1220,12 @@ def login():
         })
 
     # ---------- TEACHER LOGIN (FROM DATABASE) ----------
-    teacher = teachers_col.find_one({"username": username, "password": password})
+    teacher = teachers_col.find_one({"username": username.upper(), "password": password})
     if teacher:
         return jsonify({
             "success": True,
             "role": "teacher",
-            "token": f"teacher_{username}_token",
+            "token": f"teacher_{teacher.get('username')}_token",
             "teacher": {
                 "id": str(teacher.get("_id")),
                 "name": teacher.get("name"),
