@@ -1,12 +1,41 @@
 # PART 1/4
 import os
 import shutil
+import random
+import smtplib
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from pymongo import MongoClient, ASCENDING
 from bson.objectid import ObjectId
-from datetime import datetime
+from datetime import datetime, timedelta
 from pymongo import MongoClient
+from email.mime.text import MIMEText
+
+def _load_dotenv_simple():
+    # Load .env without extra dependency; process env already-set values take precedence.
+    candidates = [
+        os.path.join(os.getcwd(), ".env"),
+        os.path.join(os.path.dirname(__file__), ".env"),
+    ]
+    for path in candidates:
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s or s.startswith("#") or "=" not in s:
+                        continue
+                    k, v = s.split("=", 1)
+                    key = k.strip()
+                    val = v.strip().strip('"').strip("'")
+                    if key and key not in os.environ:
+                        os.environ[key] = val
+            break
+        except Exception:
+            pass
+
+_load_dotenv_simple()
 
 
 # ---------------------------
@@ -73,6 +102,90 @@ student_access_col.create_index(
     [("session", ASCENDING), ("class_name", ASCENDING), ("student_id", ASCENDING)],
     unique=True
 )
+
+OTP_STORE = {}
+SPECIAL_OTP_USERS = {"PSPSLIB", "PSPSSTU", "PSPSTEA", "ADMIN", "PRINCIPAL"}
+
+def get_special_user_email(username):
+    key = str(username or "").strip().upper()
+    val = str(os.environ.get(f"OTP_MAIL_{key}", "")).strip()
+    if key == "PRINCIPAL" and not val:
+        val = str(os.environ.get("OTP_MAIL_NAVEEN", "")).strip()
+    return val
+
+def mask_email(email):
+    e = str(email or "").strip()
+    if "@" not in e:
+        return e
+    local, domain = e.split("@", 1)
+    if len(local) <= 2:
+        masked_local = local[0] + "*" * (len(local) - 1)
+    else:
+        masked_local = local[:2] + "*" * max(1, len(local) - 2)
+    return f"{masked_local}@{domain}"
+
+def send_otp_email(to_email, otp_code, username):
+    smtp_host = os.environ.get("OTP_SMTP_HOST", "smtp.gmail.com")
+    smtp_port = int(os.environ.get("OTP_SMTP_PORT", "587"))
+    smtp_user = os.environ.get("OTP_SMTP_USER", "")
+    smtp_pass = os.environ.get("OTP_SMTP_PASS", "")
+    from_email = os.environ.get("OTP_FROM_EMAIL", smtp_user)
+
+    if not to_email:
+        return False, "Recipient email not configured"
+    if not smtp_user or not smtp_pass:
+        return False, "SMTP credentials not configured"
+
+    msg = MIMEText(
+        f"Your OTP for School ERP login is: {otp_code}\n"
+        f"This OTP expires in 5 minutes.\n"
+        f"Username: {username}"
+    )
+    msg["Subject"] = "School ERP Login OTP"
+    msg["From"] = from_email
+    msg["To"] = to_email
+
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_pass)
+            server.sendmail(from_email, [to_email], msg.as_string())
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+def get_otp_config_status(username):
+    user_key = str(username or "").strip().upper()
+    smtp_host = os.environ.get("OTP_SMTP_HOST", "smtp.gmail.com")
+    smtp_port = os.environ.get("OTP_SMTP_PORT", "587")
+    smtp_user = os.environ.get("OTP_SMTP_USER", "")
+    smtp_pass = os.environ.get("OTP_SMTP_PASS", "")
+    from_email = os.environ.get("OTP_FROM_EMAIL", smtp_user)
+    to_email = get_special_user_email(user_key)
+
+    missing = []
+    if not smtp_host:
+        missing.append("OTP_SMTP_HOST")
+    if not smtp_port:
+        missing.append("OTP_SMTP_PORT")
+    if not smtp_user:
+        missing.append("OTP_SMTP_USER")
+    if not smtp_pass:
+        missing.append("OTP_SMTP_PASS")
+    if not to_email:
+        missing.append(f"OTP_MAIL_{user_key}")
+
+    return {
+        "ok": len(missing) == 0,
+        "username": user_key,
+        "smtp_host": smtp_host,
+        "smtp_port": smtp_port,
+        "smtp_user_set": bool(smtp_user),
+        "smtp_pass_set": bool(smtp_pass),
+        "from_email": from_email,
+        "recipient_masked": mask_email(to_email) if to_email else "",
+        "missing": missing
+    }
 
 # ---------------------------
 # Flask app + uploads folder
@@ -1187,6 +1300,79 @@ def reset_teacher_password_by_identity():
 
     teachers_col.update_one({"_id": teacher["_id"]}, {"$set": {"password": new_password}})
     return jsonify({"success": True, "message": "Password updated"})
+
+@app.route("/auth/otp/request", methods=["POST"])
+def request_login_otp():
+    data = request.json or {}
+    username = str(data.get("username", "")).strip().upper()
+
+    if username not in SPECIAL_OTP_USERS:
+        return jsonify({"success": False, "message": "OTP not enabled for this user"}), 400
+
+    cfg = get_otp_config_status(username)
+    to_email = get_special_user_email(username)
+    if not cfg["ok"]:
+        return jsonify({
+            "success": False,
+            "message": "OTP config missing",
+            "debug": cfg
+        }), 400
+
+    otp_code = f"{random.randint(0, 999999):06d}"
+    expires_at = datetime.utcnow() + timedelta(minutes=5)
+    OTP_STORE[username] = {
+        "otp": otp_code,
+        "expires_at": expires_at,
+        "attempts": 0
+    }
+
+    sent, err = send_otp_email(to_email, otp_code, username)
+    if not sent:
+        return jsonify({
+            "success": False,
+            "message": f"OTP send failed: {err}",
+            "debug": cfg
+        }), 500
+
+    return jsonify({
+        "success": True,
+        "message": f"OTP sent to {mask_email(to_email)}"
+    })
+
+@app.route("/auth/otp/config-check", methods=["GET"])
+def otp_config_check():
+    username = str(request.args.get("username", "")).strip().upper()
+    if not username:
+        return jsonify({"success": False, "message": "username query param is required"}), 400
+    if username not in SPECIAL_OTP_USERS:
+        return jsonify({"success": False, "message": "OTP not enabled for this user"}), 400
+    return jsonify({"success": True, "config": get_otp_config_status(username)})
+
+@app.route("/auth/otp/verify", methods=["POST"])
+def verify_login_otp():
+    data = request.json or {}
+    username = str(data.get("username", "")).strip().upper()
+    otp = str(data.get("otp", "")).strip()
+
+    rec = OTP_STORE.get(username)
+    if not rec:
+        return jsonify({"success": False, "message": "OTP not requested"}), 400
+
+    if datetime.utcnow() > rec["expires_at"]:
+        OTP_STORE.pop(username, None)
+        return jsonify({"success": False, "message": "OTP expired"}), 400
+
+    if rec.get("attempts", 0) >= 5:
+        OTP_STORE.pop(username, None)
+        return jsonify({"success": False, "message": "Too many invalid attempts"}), 429
+
+    if otp != rec.get("otp"):
+        rec["attempts"] = rec.get("attempts", 0) + 1
+        OTP_STORE[username] = rec
+        return jsonify({"success": False, "message": "Invalid OTP"}), 401
+
+    OTP_STORE.pop(username, None)
+    return jsonify({"success": True, "message": "OTP verified"})
 # ---------------------------
 # Login (admin + teacher)
 # ---------------------------
@@ -1194,13 +1380,14 @@ def reset_teacher_password_by_identity():
 def login():
     data = request.json or {}
     username = str(data.get("username", "")).strip()
+    username_upper = username.upper()
     password = data.get("password")
 
     if not username or not password:
         return jsonify({"success": False, "message": "Missing login details"}), 400
 
     # ---------- ADMIN LOGIN (HARD-CODED) ----------
-    if username == "Admin" and password == "PS*100":
+    if username_upper == "ADMIN" and password == "PS*100":
         return jsonify({
             "success": True,
             "role": "admin",
@@ -1208,7 +1395,7 @@ def login():
         })
 
     # ---------- PRINCIPAL LOGIN (HARD-CODED) ----------
-    if username == "Naveen" and password == "14112017":
+    if username_upper == "PRINCIPAL" and password == "14112017":
         return jsonify({
             "success": True,
             "role": "principal",
