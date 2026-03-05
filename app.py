@@ -263,9 +263,9 @@ def get_student_access_flags(student_doc):
                 "student_id": student_id
             })
 
-    eligible = to_bool(access_doc.get("eligible"), True) if access_doc else True
-    release_rollno = to_bool(access_doc.get("release_rollno"), True) if access_doc else True
-    release_result = to_bool(access_doc.get("release_result"), True) if access_doc else True
+    eligible = to_bool(access_doc.get("eligible"), False) if access_doc else False
+    release_rollno = to_bool(access_doc.get("release_rollno"), False) if access_doc else False
+    release_result = to_bool(access_doc.get("release_result"), False) if access_doc else False
 
     # Business rule: non-eligible students cannot have roll/result released.
     if not eligible:
@@ -497,7 +497,9 @@ def portal_get_student(student_id):
             return jsonify({"success": False, "message": "Student not found"}), 404
 
         access = get_student_access_flags(student)
-        roll_value = student.get("rollno") if access.get("release_rollno") else ""
+        # Roll number should remain visible in student portal; release flags
+        # still control hall ticket/result access separately.
+        roll_value = student.get("rollno", "")
 
         return jsonify({
             "success": True,
@@ -511,9 +513,9 @@ def portal_get_student(student_id):
                 "photo_url": student.get("photo_url", ""),
                 "session": student.get("session"),
                 "father_name": student.get("father_name", ""),
-                "eligible": access.get("eligible", True),
-                "release_rollno": access.get("release_rollno", True),
-                "release_result": access.get("release_result", True)
+                "eligible": access.get("eligible", False),
+                "release_rollno": access.get("release_rollno", False),
+                "release_result": access.get("release_result", False)
             }
         })
     except Exception as e:
@@ -524,7 +526,7 @@ def portal_list_students():
     students = []
     for s in students_col.find():
         access = get_student_access_flags(s)
-        roll_value = s.get("rollno") if access.get("release_rollno") else ""
+        roll_value = s.get("rollno", "")
         students.append({
             "id": str(s["_id"]),
             "name": s.get("student_name"),
@@ -534,9 +536,9 @@ def portal_list_students():
             "roll": roll_value,
             "photo_url": s.get("photo_url", ""),
             "session": s.get("session"),
-            "eligible": access.get("eligible", True),
-            "release_rollno": access.get("release_rollno", True),
-            "release_result": access.get("release_result", True)
+            "eligible": access.get("eligible", False),
+            "release_rollno": access.get("release_rollno", False),
+            "release_result": access.get("release_result", False)
         })
     return jsonify({"success": True, "students": students})
 
@@ -578,9 +580,9 @@ def student_access_list():
         sid = str(s.get("_id"))
         setting = setting_map.get(sid, {})
 
-        eligible = to_bool(setting.get("eligible"), True)
-        release_rollno = to_bool(setting.get("release_rollno"), True)
-        release_result = to_bool(setting.get("release_result"), True)
+        eligible = to_bool(setting.get("eligible"), False)
+        release_rollno = to_bool(setting.get("release_rollno"), False)
+        release_result = to_bool(setting.get("release_result"), False)
         if not eligible:
             release_rollno = False
             release_result = False
@@ -615,9 +617,9 @@ def student_access_save():
         if not sid:
             continue
 
-        eligible = to_bool(row.get("eligible"), True)
-        release_rollno = to_bool(row.get("release_rollno"), True)
-        release_result = to_bool(row.get("release_result"), True)
+        eligible = to_bool(row.get("eligible"), False)
+        release_rollno = to_bool(row.get("release_rollno"), False)
+        release_result = to_bool(row.get("release_result"), False)
         if not eligible:
             release_rollno = False
             release_result = False
@@ -1428,7 +1430,7 @@ def login():
 
     if student:
         access = get_student_access_flags(student)
-        roll_value = student.get("rollno") if access.get("release_rollno") else ""
+        roll_value = student.get("rollno", "")
         return jsonify({
             "success": True,
             "role": "student",
@@ -1442,9 +1444,9 @@ def login():
                 "section": student.get("section"),
                 "session": student.get("session"),
                 "photo_url": student.get("photo_url", ""),
-                "eligible": access.get("eligible", True),
-                "release_rollno": access.get("release_rollno", True),
-                "release_result": access.get("release_result", True)
+                "eligible": access.get("eligible", False),
+                "release_rollno": access.get("release_rollno", False),
+                "release_result": access.get("release_result", False)
             }
         })
     # ---------- INVALID LOGIN ----------
