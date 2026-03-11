@@ -8,8 +8,8 @@ class WebsiteUser(HttpUser):
     @task
     def login(self):
         with self.client.post("https://exam-backend-117372286918.asia-south1.run.app/login", json={
-            "username": "ADMIN",
-            "password": "PS*100"
+            "username": "PSPSLIB",
+            "password": "14112017"
         }, catch_response=True) as response:
 
             if response.status_code != 200:

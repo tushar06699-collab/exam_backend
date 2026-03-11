@@ -3,6 +3,10 @@ import os
 import shutil
 import random
 import smtplib
+import json
+import re
+import urllib.request
+import urllib.error
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from pymongo import MongoClient, ASCENDING
@@ -41,18 +45,25 @@ _load_dotenv_simple()
 # ---------------------------
 # MongoDB connection
 # ---------------------------
-MONGO_URL = "mongodb+srv://myusere:mypassword123@cluster0.fpsihrb.mongodb.net/?appName=Cluster0"
+MONGO_URL = os.environ.get(
+    "MONGO_URL",
+    "mongodb+srv://myusere:mypassword123@cluster0.fpsihrb.mongodb.net/?appName=Cluster0"
+)
 client = MongoClient(MONGO_URL)
 db = client["school_exam_db"]
 
 # --------------------------------------------------------
 # MongoDB (STUDENT DATABASE ONLY)
 # --------------------------------------------------------
-STUDENT_MONGO_URI = "mongodb+srv://school_students:Tushar2007@cluster0.upoywck.mongodb.net/school_erp?retryWrites=true&w=majority"
+STUDENT_MONGO_URI = os.environ.get(
+    "STUDENT_MONGO_URI",
+    "mongodb+srv://school_students:Tushar2007@cluster0.upoywck.mongodb.net/school_erp?retryWrites=true&w=majority"
+)
 
 student_client = MongoClient(STUDENT_MONGO_URI)
 student_db = student_client["school_erp"]
 students_col = student_db["students"]
+student_teachers_col = student_db["teachers"]
 
 
 # Collections (mirror of your sqlite tables)
@@ -105,6 +116,216 @@ student_access_col.create_index(
 
 OTP_STORE = {}
 SPECIAL_OTP_USERS = {"PSPSLIB", "PSPSSTU", "PSPSTEA", "ADMIN", "PRINCIPAL"}
+
+def mask_mobile(mobile):
+    raw = str(mobile or "").strip()
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if len(digits) >= 10:
+        d = digits[-10:]
+        return f"{d[:2]}XXXXXX{d[-2:]}"
+    if len(digits) >= 4:
+        return f"{digits[:2]}XX{digits[-2:]}"
+    return raw
+
+def normalize_sms_mobile(mobile):
+    digits = "".join(ch for ch in str(mobile or "") if ch.isdigit())
+    if len(digits) == 10:
+        return "+91" + digits
+    if len(digits) == 12 and digits.startswith("91"):
+        return "+" + digits
+    if str(mobile or "").strip().startswith("+"):
+        return str(mobile).strip()
+    return str(mobile or "").strip()
+
+def find_student_teacher_profile(exam_teacher):
+    if not exam_teacher:
+        return {}
+
+    teacher_code = str(exam_teacher.get("teacher_id", "")).strip()
+    username = str(exam_teacher.get("username", "")).strip()
+    display_name = str(exam_teacher.get("name", "")).strip()
+
+    lookup_filters = []
+    if teacher_code:
+        lookup_filters.extend([
+            {"teacher_code": teacher_code},
+            {"employee_id": teacher_code}
+        ])
+    if username:
+        lookup_filters.append({"employee_id": username})
+    if display_name:
+        lookup_filters.append({"teacher_name": {"$regex": f"^{re.escape(display_name)}$", "$options": "i"}})
+
+    profile = None
+    for q in lookup_filters:
+        profile = student_teachers_col.find_one(q)
+        if profile:
+            break
+
+    return {
+        "teacher_name": (profile or {}).get("teacher_name") or display_name or username,
+        "mobile": str((profile or {}).get("mobile", "")).strip(),
+        "photo_url": str((profile or {}).get("photo_url", "")).strip(),
+    }
+
+def get_teacher_profile_payload(username):
+    username_u = str(username or "").strip().upper()
+    if not username_u:
+        return None, None, None
+    teacher = teachers_col.find_one({"username": username_u})
+    if not teacher:
+        return None, None, None
+    profile = find_student_teacher_profile(teacher)
+    teacher_payload = {
+        "username": username_u,
+        "name": profile.get("teacher_name", teacher.get("name", username_u)),
+        "photo_url": profile.get("photo_url", ""),
+        "mobile_masked": mask_mobile(profile.get("mobile", ""))
+    }
+    return teacher, profile, teacher_payload
+
+def _is_sms_response_success(data):
+    if isinstance(data, dict):
+        if data.get("success") is True:
+            return True
+        if data.get("status") in {"success", "ok", 200, "200"}:
+            return True
+        if data.get("message") in {"success", "queued", "sent"}:
+            return True
+    return False
+
+def send_textbee_otp(mobile, otp_code, teacher_name):
+    api_url = str(os.environ.get("TEXTBEE_API_URL", "")).strip()
+    api_key = str(os.environ.get("TEXTBEE_API_KEY", "")).strip()
+    device_id = str(os.environ.get("TEXTBEE_DEVICE_ID", "")).strip()
+
+    if not api_url:
+        return False, "TEXTBEE_API_URL not configured"
+    if not api_key:
+        return False, "TEXTBEE_API_KEY not configured"
+
+    to_mobile = normalize_sms_mobile(mobile)
+    sms_text = f"Dear {teacher_name or 'Teacher'}, your login OTP is {otp_code}. Valid for 5 minutes. - School ERP"
+
+    auth_variants = [
+        {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "x-api-key": api_key,
+        },
+        {
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+        },
+        {
+            "Content-Type": "application/json",
+            "Authorization": api_key,
+        }
+    ]
+
+    base_url = api_url
+    for suffix in ["/api/v1/messages", "/api/v1/message/send", "/api/v1/send-sms", "/api/v1/sms/send"]:
+        if base_url.lower().endswith(suffix):
+            base_url = base_url[: -len(suffix)]
+            break
+    base_url = base_url.rstrip("/")
+
+    endpoint_candidates = [api_url]
+    if base_url:
+        endpoint_candidates.extend([
+            f"{base_url}/api/v1/messages",
+            f"{base_url}/api/v1/message/send",
+            f"{base_url}/api/v1/send-sms",
+            f"{base_url}/api/v1/sms/send",
+        ])
+        if device_id:
+            endpoint_candidates.extend([
+                f"{base_url}/api/v1/gateway/devices/{device_id}/send-sms",
+                f"{base_url}/api/v1/gateway/devices/{device_id}/messages",
+                f"{base_url}/api/v1/devices/{device_id}/messages",
+            ])
+
+    # preserve order while removing duplicates
+    endpoint_candidates = list(dict.fromkeys([e for e in endpoint_candidates if e]))
+
+    payload_templates = [
+        {"recipients": [to_mobile], "message": sms_text},
+        {"phone": to_mobile, "message": sms_text},
+        {"to": to_mobile, "message": sms_text},
+        {"mobile": to_mobile, "message": sms_text},
+    ]
+    payloads = []
+    for p in payload_templates:
+        payloads.append(dict(p))
+        if device_id:
+            with_device = dict(p)
+            with_device["deviceId"] = device_id
+            payloads.append(with_device)
+
+    request_timeout = float(os.environ.get("TEXTBEE_TIMEOUT_SEC", "4"))
+    max_attempts = int(os.environ.get("TEXTBEE_MAX_ATTEMPTS", "12"))
+    attempts = 0
+    last_err = "SMS send failed"
+    for endpoint in endpoint_candidates:
+        for headers in auth_variants:
+            for payload in payloads:
+                if attempts >= max_attempts:
+                    return False, last_err
+                attempts += 1
+                req = urllib.request.Request(
+                    endpoint,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers=headers,
+                    method="POST"
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=request_timeout) as resp:
+                        body = resp.read().decode("utf-8", errors="ignore")
+                        parsed = {}
+                        try:
+                            parsed = json.loads(body) if body else {}
+                        except Exception:
+                            parsed = {}
+                        if 200 <= resp.status < 300 and (not parsed or _is_sms_response_success(parsed)):
+                            return True, ""
+                        if 200 <= resp.status < 300 and parsed:
+                            return True, ""
+                        last_err = body or f"http {resp.status}"
+                except urllib.error.HTTPError as e:
+                    try:
+                        err_body = e.read().decode("utf-8", errors="ignore")
+                    except Exception:
+                        err_body = str(e)
+                    last_err = f"{endpoint} :: {err_body or str(e)}"
+                except Exception as e:
+                    last_err = f"{endpoint} :: {str(e)}"
+
+    return False, last_err
+
+def get_teacher_otp_config_status():
+    api_url = str(os.environ.get("TEXTBEE_API_URL", "")).strip()
+    api_key = str(os.environ.get("TEXTBEE_API_KEY", "")).strip()
+    device_id = str(os.environ.get("TEXTBEE_DEVICE_ID", "")).strip()
+    timeout_sec = str(os.environ.get("TEXTBEE_TIMEOUT_SEC", "4")).strip()
+    max_attempts = str(os.environ.get("TEXTBEE_MAX_ATTEMPTS", "12")).strip()
+
+    missing = []
+    if not api_url:
+        missing.append("TEXTBEE_API_URL")
+    if not api_key:
+        missing.append("TEXTBEE_API_KEY")
+    if not device_id:
+        missing.append("TEXTBEE_DEVICE_ID")
+
+    return {
+        "ok": len(missing) == 0,
+        "api_url": api_url,
+        "api_key_set": bool(api_key),
+        "device_id_set": bool(device_id),
+        "timeout_sec": timeout_sec,
+        "max_attempts": max_attempts,
+        "missing": missing
+    }
 
 def get_special_user_email(username):
     key = str(username or "").strip().upper()
@@ -1375,6 +1596,94 @@ def verify_login_otp():
 
     OTP_STORE.pop(username, None)
     return jsonify({"success": True, "message": "OTP verified"})
+
+@app.route("/teacher/auth/otp/request", methods=["POST"])
+def request_teacher_login_otp():
+    data = request.json or {}
+    username = str(data.get("username", "")).strip().upper()
+
+    if not username:
+        return jsonify({"success": False, "message": "username is required"}), 400
+
+    teacher, profile, teacher_payload = get_teacher_profile_payload(username)
+    if not teacher:
+        return jsonify({"success": False, "message": "Teacher not found"}), 404
+
+    mobile = str(profile.get("mobile", "")).strip()
+    if not mobile:
+        return jsonify({
+            "success": False,
+            "message": "Teacher mobile number not found in backend",
+            "teacher": teacher_payload
+        }), 400
+
+    otp_code = f"{random.randint(0, 999999):06d}"
+    expires_at = datetime.utcnow() + timedelta(minutes=5)
+    otp_key = f"TEACHER::{username}"
+    OTP_STORE[otp_key] = {
+        "otp": otp_code,
+        "expires_at": expires_at,
+        "attempts": 0,
+        "username": username,
+    }
+
+    sent, err = send_textbee_otp(mobile, otp_code, profile.get("teacher_name", "Teacher"))
+    if not sent:
+        return jsonify({
+            "success": False,
+            "message": f"OTP send failed: {err}",
+            "teacher": teacher_payload
+        }), 500
+
+    return jsonify({
+        "success": True,
+        "message": f"OTP sent to {mask_mobile(mobile)}",
+        "teacher": teacher_payload
+    })
+
+@app.route("/teacher/auth/otp/config-check", methods=["GET"])
+def teacher_auth_otp_config_check():
+    return jsonify({
+        "success": True,
+        "config": get_teacher_otp_config_status()
+    })
+
+@app.route("/teacher/auth/profile", methods=["GET"])
+def teacher_auth_profile():
+    username = str(request.args.get("username", "")).strip().upper()
+    if not username:
+        return jsonify({"success": False, "message": "username query param is required"}), 400
+    teacher, profile, teacher_payload = get_teacher_profile_payload(username)
+    if not teacher:
+        return jsonify({"success": False, "message": "Teacher not found"}), 404
+    return jsonify({"success": True, "teacher": teacher_payload})
+
+@app.route("/teacher/auth/otp/verify", methods=["POST"])
+def verify_teacher_login_otp():
+    data = request.json or {}
+    username = str(data.get("username", "")).strip().upper()
+    otp = str(data.get("otp", "")).strip()
+    otp_key = f"TEACHER::{username}"
+    rec = OTP_STORE.get(otp_key)
+
+    if not rec:
+        return jsonify({"success": False, "message": "OTP not requested"}), 400
+
+    if datetime.utcnow() > rec["expires_at"]:
+        OTP_STORE.pop(otp_key, None)
+        return jsonify({"success": False, "message": "OTP expired"}), 400
+
+    if rec.get("attempts", 0) >= 5:
+        OTP_STORE.pop(otp_key, None)
+        return jsonify({"success": False, "message": "Too many invalid attempts"}), 429
+
+    if otp != rec.get("otp"):
+        rec["attempts"] = rec.get("attempts", 0) + 1
+        OTP_STORE[otp_key] = rec
+        return jsonify({"success": False, "message": "Invalid OTP"}), 401
+
+    OTP_STORE.pop(otp_key, None)
+    return jsonify({"success": True, "message": "OTP verified"})
 # ---------------------------
 # Login (admin + teacher)
 # ---------------------------
@@ -1417,6 +1726,7 @@ def login():
             "token": f"teacher_{teacher.get('username')}_token",
             "teacher": {
                 "id": str(teacher.get("_id")),
+                "teacher_id": teacher.get("teacher_id", ""),
                 "name": teacher.get("name"),
                 "username": teacher.get("username"),
                 "session": teacher.get("session")
