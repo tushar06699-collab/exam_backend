@@ -78,6 +78,7 @@ internal_marks_col = db["internal_marks"]
 internal_config_col = db["internal_config"]
 result_publish_col = db["result_publish"]
 exam_subject_config_col = db["exam_subject_config"]
+teacher_daily_work_col = db["teacher_daily_work"]
 student_access_col = db["student_exam_access"]
 
 # Create useful indexes to emulate UNIQUE constraints where used in sqlite
@@ -2146,6 +2147,89 @@ def list_attendance():
         })
 
     return jsonify({"success": True, "attendance": records})
+
+
+# ----------------------------
+# Teacher Daily Work
+# ----------------------------
+@app.route("/teacher/daily-work/save", methods=["POST"])
+def save_teacher_daily_work():
+    data = request.get_json() or {}
+    session = (data.get("session") or "").strip()
+    class_name = (data.get("class_name") or "").strip()
+    date = (data.get("date") or "").strip()
+    teacher_id = str(data.get("teacher_id") or "").strip()
+    teacher_name = (data.get("teacher_name") or "").strip()
+    subject = (data.get("subject") or "").strip()
+    work = (data.get("work") or "").strip()
+
+    if not session or not class_name or not date or not teacher_id or not work:
+        return jsonify({"success": False, "message": "Missing required fields"}), 400
+
+    payload = {
+        "session": session,
+        "class_name": class_name,
+        "date": date,
+        "teacher_id": teacher_id,
+        "teacher_name": teacher_name,
+        "subject": subject,
+        "work": work,
+        "updated_at": datetime.utcnow(),
+    }
+    teacher_daily_work_col.update_one(
+        {"session": session, "class_name": class_name, "date": date, "teacher_id": teacher_id, "subject": subject},
+        {"$set": payload, "$setOnInsert": {"created_at": datetime.utcnow()}},
+        upsert=True,
+    )
+    return jsonify({"success": True, "message": "Work saved"})
+
+
+@app.route("/teacher/daily-work/get", methods=["GET"])
+def get_teacher_daily_work():
+    session = (request.args.get("session") or "").strip()
+    class_name = (request.args.get("class_name") or "").strip()
+    date = (request.args.get("date") or "").strip()
+    teacher_id = str(request.args.get("teacher_id") or "").strip()
+    subject = (request.args.get("subject") or "").strip()
+    if not session or not class_name or not date or not teacher_id or not subject:
+        return jsonify({"success": False, "message": "Missing parameters"}), 400
+
+    doc = teacher_daily_work_col.find_one(
+        {"session": session, "class_name": class_name, "date": date, "teacher_id": teacher_id, "subject": subject},
+        {"_id": 0}
+    )
+    return jsonify({"success": True, "work": doc})
+
+
+@app.route("/teacher/daily-work/list", methods=["GET"])
+def list_teacher_daily_work():
+    session = (request.args.get("session") or "").strip()
+    teacher_id = str(request.args.get("teacher_id") or "").strip()
+    date = (request.args.get("date") or "").strip()
+    class_name = (request.args.get("class_name") or "").strip()
+    if not session or not teacher_id or not date:
+        return jsonify({"success": False, "message": "Missing parameters"}), 400
+
+    q = {"session": session, "teacher_id": teacher_id, "date": date}
+    if class_name:
+        q["class_name"] = class_name
+    docs = list(teacher_daily_work_col.find(q, {"_id": 0}))
+    return jsonify({"success": True, "rows": docs})
+
+
+@app.route("/student/daily-work/list", methods=["GET"])
+def list_student_daily_work():
+    session = (request.args.get("session") or "").strip()
+    class_name = (request.args.get("class_name") or "").strip()
+    date = (request.args.get("date") or "").strip()
+    if not session or not class_name or not date:
+        return jsonify({"success": False, "message": "Missing parameters"}), 400
+
+    docs = list(teacher_daily_work_col.find(
+        {"session": session, "class_name": class_name, "date": date},
+        {"_id": 0}
+    ))
+    return jsonify({"success": True, "rows": docs})
 
 # =========================
 # HOLIDAY MANAGEMENT
