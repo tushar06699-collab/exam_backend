@@ -7,7 +7,7 @@ import json
 import re
 import urllib.request
 import urllib.error
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, Response, make_response
 from flask_cors import CORS
 from pymongo import MongoClient, ASCENDING
 from bson.objectid import ObjectId
@@ -79,6 +79,7 @@ internal_config_col = db["internal_config"]
 result_publish_col = db["result_publish"]
 exam_subject_config_col = db["exam_subject_config"]
 teacher_daily_work_col = db["teacher_daily_work"]
+rooms_col = db["rooms"]
 student_access_col = db["student_exam_access"]
 
 # Create useful indexes to emulate UNIQUE constraints where used in sqlite
@@ -167,6 +168,8 @@ def find_student_teacher_profile(exam_teacher):
         "teacher_name": (profile or {}).get("teacher_name") or display_name or username,
         "mobile": str((profile or {}).get("mobile", "")).strip(),
         "photo_url": str((profile or {}).get("photo_url", "")).strip(),
+        "dob": str((profile or {}).get("dob", "")).strip() or str((profile or {}).get("date_of_birth", "")).strip(),
+        "teacher_code": str((profile or {}).get("teacher_code", "")).strip(),
     }
 
 def get_teacher_profile_payload(username):
@@ -335,6 +338,20 @@ def get_special_user_email(username):
         val = str(os.environ.get("OTP_MAIL_NAVEEN", "")).strip()
     return val
 
+def get_teacher_otp_email(username):
+    key = str(username or "").strip().upper()
+    candidates = [
+        os.environ.get(f"OTP_MAIL_{key}", ""),
+        os.environ.get("OTP_MAIL_PSPSTEA", ""),
+        os.environ.get("OTP_MAIL_TEACHER", ""),
+        os.environ.get("OTP_MAIL_ADMIN", ""),
+    ]
+    for c in candidates:
+        c = str(c or "").strip()
+        if c:
+            return c
+    return ""
+
 def mask_email(email):
     e = str(email or "").strip()
     if "@" not in e:
@@ -345,6 +362,52 @@ def mask_email(email):
     else:
         masked_local = local[:2] + "*" * max(1, len(local) - 2)
     return f"{masked_local}@{domain}"
+
+def _normalize_teacher_name_for_password(name):
+    return re.sub(r"[^A-Z0-9]", "", str(name or "").upper())
+
+def _dob_candidates_for_password(raw):
+    s = str(raw or "").strip()
+    if not s:
+        return []
+    candidates = []
+    m = re.match(r"^(\d{4})[-\/](\d{2})[-\/](\d{2})$", s)  # yyyy-mm-dd
+    if m:
+        candidates.append(f"{m.group(3)}{m.group(2)}{m.group(1)}")
+        candidates.append(f"{m.group(1)}{m.group(2)}{m.group(3)}")
+    m = re.match(r"^(\d{2})[-\/](\d{2})[-\/](\d{4})$", s)  # dd-mm-yyyy
+    if m:
+        candidates.append(f"{m.group(1)}{m.group(2)}{m.group(3)}")
+        candidates.append(f"{m.group(3)}{m.group(2)}{m.group(1)}")
+    digits = re.sub(r"\D", "", s)
+    if re.match(r"^\d{8}$", digits):
+        candidates.append(digits)
+        candidates.append(f"{digits[4:8]}{digits[2:4]}{digits[0:2]}")
+    # Remove duplicates while preserving order
+    out = []
+    for c in candidates:
+        if c not in out:
+            out.append(c)
+    return out
+
+def _teacher_password_matches(name, dob, raw_password, teacher_code=""):
+    if not raw_password:
+        return False
+    raw_norm = str(raw_password).strip().upper().replace(" ", "")
+    code_digits = re.sub(r"\D", "", str(teacher_code or "")).zfill(4)
+    if code_digits:
+        for dob_code in _dob_candidates_for_password(dob):
+            if raw_norm == f"{code_digits}@{dob_code}":
+                return True
+    name_part = _normalize_teacher_name_for_password(name)
+    if name_part:
+        for dob_code in _dob_candidates_for_password(dob):
+            if raw_norm == f"{name_part}@{dob_code}":
+                return True
+    for dob_code in _dob_candidates_for_password(dob):
+        if raw_norm == dob_code:
+            return True
+    return False
 
 def send_otp_email(to_email, otp_code, username):
     smtp_host = os.environ.get("OTP_SMTP_HOST", "smtp.gmail.com")
@@ -414,6 +477,27 @@ def get_otp_config_status(username):
 # ---------------------------
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+
+@app.before_request
+def _handle_preflight():
+    if request.method == "OPTIONS":
+        resp = make_response("", 204)
+        resp.headers["Access-Control-Allow-Origin"] = request.headers.get("Origin", "*")
+        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = request.headers.get(
+            "Access-Control-Request-Headers",
+            "Content-Type, Authorization"
+        )
+        resp.headers["Access-Control-Max-Age"] = "3600"
+        return resp
+
+@app.after_request
+def _add_cors_headers(resp):
+    if not resp.headers.get("Access-Control-Allow-Origin"):
+        resp.headers["Access-Control-Allow-Origin"] = request.headers.get("Origin", "*")
+    resp.headers.setdefault("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
+    resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization")
+    return resp
 
 PAPER_DIR = "papers"
 os.makedirs(PAPER_DIR, exist_ok=True)
@@ -1630,6 +1714,17 @@ def request_teacher_login_otp():
 
     sent, err = send_textbee_otp(mobile, otp_code, profile.get("teacher_name", "Teacher"))
     if not sent:
+        fallback_email = get_teacher_otp_email(username)
+        if fallback_email:
+            email_sent, email_err = send_otp_email(fallback_email, otp_code, username)
+            if email_sent:
+                return jsonify({
+                    "success": True,
+                    "message": f"OTP sent to email {mask_email(fallback_email)}",
+                    "channel": "email",
+                    "teacher": teacher_payload
+                })
+            err = f"{err}; email failed: {email_err}"
         return jsonify({
             "success": False,
             "message": f"OTP send failed: {err}",
@@ -1639,6 +1734,7 @@ def request_teacher_login_otp():
     return jsonify({
         "success": True,
         "message": f"OTP sent to {mask_mobile(mobile)}",
+        "channel": "sms",
         "teacher": teacher_payload
     })
 
@@ -1719,20 +1815,27 @@ def login():
         })
 
     # ---------- TEACHER LOGIN (FROM DATABASE) ----------
-    teacher = teachers_col.find_one({"username": username.upper(), "password": password})
+    teacher = teachers_col.find_one({"username": username.upper()})
     if teacher:
-        return jsonify({
-            "success": True,
-            "role": "teacher",
-            "token": f"teacher_{teacher.get('username')}_token",
-            "teacher": {
-                "id": str(teacher.get("_id")),
-                "teacher_id": teacher.get("teacher_id", ""),
-                "name": teacher.get("name"),
-                "username": teacher.get("username"),
-                "session": teacher.get("session")
-            }
-        })
+        profile = find_student_teacher_profile(teacher)
+        if teacher.get("password") == password or _teacher_password_matches(
+            profile.get("teacher_name") or teacher.get("name"),
+            profile.get("dob"),
+            password,
+            profile.get("teacher_code") or teacher.get("teacher_id") or teacher.get("teacher_code")
+        ):
+            return jsonify({
+                "success": True,
+                "role": "teacher",
+                "token": f"teacher_{teacher.get('username')}_token",
+                "teacher": {
+                    "id": str(teacher.get("_id")),
+                    "teacher_id": teacher.get("teacher_id", ""),
+                    "name": teacher.get("name"),
+                    "username": teacher.get("username"),
+                    "session": teacher.get("session")
+                }
+            })
     # -------- STUDENT LOGIN (MONGODB) --------
     student = students_col.find_one({
         "admission_no": username,
@@ -2230,6 +2333,55 @@ def list_student_daily_work():
         {"_id": 0}
     ))
     return jsonify({"success": True, "rows": docs})
+
+
+# ----------------------------
+# Room Management
+# ----------------------------
+@app.route("/rooms/list", methods=["GET"])
+def list_rooms():
+    session = (request.args.get("session") or "").strip()
+    if not session:
+        return jsonify({"success": False, "message": "Missing session"}), 400
+    rows = list(rooms_col.find({"session": session}, {"_id": 0}).sort([("room_no", ASCENDING)]))
+    return jsonify({"success": True, "rooms": rows})
+
+
+@app.route("/rooms/save", methods=["POST"])
+def save_room():
+    data = request.get_json() or {}
+    session = (data.get("session") or "").strip()
+    room_no = (data.get("room_no") or "").strip()
+    rows = int(data.get("rows") or 0)
+    benches_per_row = int(data.get("benches_per_row") or 0)
+    seats_per_bench = int(data.get("seats_per_bench") or 0)
+    if not session or not room_no or rows <= 0 or benches_per_row <= 0 or seats_per_bench <= 0:
+        return jsonify({"success": False, "message": "Invalid room data"}), 400
+
+    rooms_col.update_one(
+        {"session": session, "room_no": room_no},
+        {"$set": {
+            "session": session,
+            "room_no": room_no,
+            "rows": rows,
+            "benches_per_row": benches_per_row,
+            "seats_per_bench": seats_per_bench,
+            "updated_at": datetime.utcnow()
+        }, "$setOnInsert": {"created_at": datetime.utcnow()}},
+        upsert=True
+    )
+    return jsonify({"success": True, "message": "Room saved"})
+
+
+@app.route("/rooms/delete", methods=["POST"])
+def delete_room():
+    data = request.get_json() or {}
+    session = (data.get("session") or "").strip()
+    room_no = (data.get("room_no") or "").strip()
+    if not session or not room_no:
+        return jsonify({"success": False, "message": "Missing session/room"}), 400
+    rooms_col.delete_one({"session": session, "room_no": room_no})
+    return jsonify({"success": True, "message": "Room deleted"})
 
 # =========================
 # HOLIDAY MANAGEMENT
