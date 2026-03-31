@@ -2027,6 +2027,34 @@ def get_used_days():
     return jsonify({"success": True, "used_days": sorted(list(used_days))})
 
 
+# ---------------------------
+# Get distinct teachers for a session timetable (/timetable/teachers)
+# ---------------------------
+@app.route("/timetable/teachers")
+def get_timetable_teachers():
+    session = request.args.get("session")
+    if not session:
+        return jsonify({"success": False, "teachers": []}), 400
+
+    teacher_ids = timetable_col.distinct("teacher_id", {"session": session})
+    teachers = []
+    for tid in teacher_ids:
+        name = ""
+        try:
+            if ObjectId.is_valid(str(tid)):
+                t_doc = teachers_col.find_one({"_id": ObjectId(str(tid))})
+            else:
+                t_doc = teachers_col.find_one({"teacher_id": str(tid)})
+            if t_doc:
+                name = t_doc.get("name", "") or t_doc.get("teacher_name", "")
+        except Exception:
+            name = ""
+        teachers.append({"id": str(tid), "name": name})
+
+    teachers.sort(key=lambda t: (t.get("name") or "", t.get("id") or ""))
+    return jsonify({"success": True, "teachers": teachers})
+
+
 @app.route("/", methods=["GET"])
 def home():
     return "Backend Running", 200
@@ -2205,6 +2233,7 @@ def save_attendance():
     for att in attendance_list:
         student_id = normalize_student_id(att.get("student_id"))
         student_roll = att.get("student_roll")
+        student_admission = att.get("student_admission")
         status = att.get("status")
         if student_id and status in ["present", "absent", "leave"]:
             to_insert.append({
@@ -2213,6 +2242,7 @@ def save_attendance():
                 "date": date,
                 "student_id": student_id,
                 "student_roll": str(student_roll or "").strip(),
+                "student_admission": str(student_admission or "").strip(),
                 "status": status
             })
 
@@ -2246,9 +2276,48 @@ def list_attendance():
         records.append({
             "student_id": sid,
             "student_roll": att.get("student_roll", ""),
+            "student_admission": att.get("student_admission", ""),
             "status": att.get("status")
         })
 
+    return jsonify({"success": True, "attendance": records})
+
+
+# ---------------------------
+# Get attendance for class + month (/attendance/list-monthly)
+# ---------------------------
+@app.route("/attendance/list-monthly", methods=["GET"])
+def list_attendance_monthly():
+    """
+    Query params:
+        session=2025_26
+        class_name=Class 1
+        month=2025-12
+    """
+    session = request.args.get("session")
+    class_name = request.args.get("class_name")
+    month = request.args.get("month")
+    if not session or not class_name or not month:
+        return jsonify({"success": False, "attendance": [], "message": "Missing parameters"}), 400
+
+    sessions = session_variants(session)
+    # match any date within the month
+    month_prefix = str(month).strip()
+    cursor = attendance_col.find({
+        "session": {"$in": sessions} if sessions else session,
+        "class_name": class_name,
+        "date": {"$regex": f"^{month_prefix}-"}
+    })
+    records = []
+    for att in cursor:
+        sid = normalize_student_id(att.get("student_id"))
+        records.append({
+            "student_id": sid,
+            "student_roll": att.get("student_roll", ""),
+            "student_admission": att.get("student_admission", ""),
+            "status": att.get("status"),
+            "date": att.get("date", "")
+        })
     return jsonify({"success": True, "attendance": records})
 
 
