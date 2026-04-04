@@ -1904,7 +1904,7 @@ def set_timetable():
     teacher_id = data.get("teacher_id")
     timetable_list = data.get("timetable", [])
 
-    if not session or not teacher_id or not timetable_list:
+    if not session or not teacher_id:
         return jsonify({"success": False, "message": "Missing data"}), 400
 
     # delete existing entries for this teacher+session (mirror sqlite behavior)
