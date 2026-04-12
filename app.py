@@ -1561,6 +1561,48 @@ def get_teacher(teacher_id):
     else:
         return jsonify({"error": "Teacher not found"}), 404
 
+@app.route("/teacher/update/<teacher_id>", methods=["PUT"])
+def update_teacher(teacher_id):
+    data = request.json or {}
+    name = str(data.get("name", "")).strip()
+    username = str(data.get("username", "")).strip().upper()
+    password = str(data.get("password", "")).strip()
+    session = str(data.get("session", "")).strip()
+
+    teacher = None
+    try:
+        teacher = teachers_col.find_one({"_id": ObjectId(teacher_id)})
+    except Exception:
+        teacher = None
+
+    if not teacher:
+        teacher = teachers_col.find_one({"teacher_id": teacher_id})
+
+    if not teacher:
+        return jsonify({"success": False, "message": "Teacher not found"}), 404
+
+    if not session:
+        session = teacher.get("session")
+
+    if not name or not username:
+        return jsonify({"success": False, "message": "Name and username are required"}), 400
+
+    # Check username uniqueness within session (exclude current teacher)
+    existing = teachers_col.find_one({
+        "username": username,
+        "session": session,
+        "_id": {"$ne": teacher["_id"]}
+    })
+    if existing:
+        return jsonify({"success": False, "message": "Username already exists"}), 400
+
+    update_doc = {"name": name, "username": username}
+    if password:
+        update_doc["password"] = password
+
+    teachers_col.update_one({"_id": teacher["_id"]}, {"$set": update_doc})
+    return jsonify({"success": True, "message": "Teacher updated"})
+
 @app.route("/teacher/reset-password/<teacher_id>", methods=["PUT"])
 def reset_teacher_password(teacher_id):
     data = request.json or {}
