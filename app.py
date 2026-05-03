@@ -2159,6 +2159,7 @@ def upload_notice():
     description = request.form.get("description", "")
     date = request.form.get("date")        # YYYY-MM-DD
     target = request.form.get("target")    # student | teacher | both
+    session = request.form.get("session", "").strip()
     file = request.files.get("pdf")
 
     if not title or not date:
@@ -2177,6 +2178,7 @@ def upload_notice():
         "title": title,
         "description": description,
         "date": date,
+        "session": session,
         "target": target,                # ✅ STORED
         "file": filename,
         "uploaded_at": datetime.utcnow()
@@ -2190,12 +2192,15 @@ def upload_notice():
 @app.route("/notice/list", methods=["GET"])
 def list_notices():
     role = request.args.get("role")  # student | teacher | None
+    session = request.args.get("session", "").strip()
 
     query = {}
     if role in ["student", "teacher"]:
         query = {
             "target": {"$in": [role, "both"]}
         }
+    if session:
+        query["session"] = session
 
     notices = []
     for n in notices_col.find(query).sort("uploaded_at", -1):
@@ -2204,6 +2209,7 @@ def list_notices():
             "title": n.get("title"),
             "description": n.get("description"),
             "date": n.get("date"),
+            "session": n.get("session", ""),
             "target": n.get("target", "student"),
             "file": n.get("file"),
             "url": f"/notice/get-file/{n.get('file')}" if n.get("file") else None
@@ -2384,6 +2390,7 @@ def save_teacher_daily_work():
         "session": session,
         "class_name": class_name,
         "date": date,
+        "session": session,
         "teacher_id": teacher_id,
         "teacher_name": teacher_name,
         "subject": subject,
@@ -2745,3 +2752,4 @@ import os
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
