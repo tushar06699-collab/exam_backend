@@ -7,6 +7,7 @@ import json
 import re
 import urllib.request
 import urllib.error
+from io import BytesIO
 from flask import Flask, request, jsonify, send_file, Response, make_response
 from flask_cors import CORS
 from pymongo import MongoClient, ASCENDING
@@ -14,6 +15,7 @@ from bson.objectid import ObjectId
 from datetime import datetime, timedelta
 from pymongo import MongoClient
 from email.mime.text import MIMEText
+from openpyxl import Workbook, load_workbook
 
 def _load_dotenv_simple():
     # Load .env without extra dependency; process env already-set values take precedence.
@@ -81,6 +83,7 @@ exam_subject_config_col = db["exam_subject_config"]
 teacher_daily_work_col = db["teacher_daily_work"]
 rooms_col = db["rooms"]
 student_access_col = db["student_exam_access"]
+syllabus_col = db["syllabus"]
 
 # Create useful indexes to emulate UNIQUE constraints where used in sqlite
 # Note: index creation is idempotent
@@ -115,6 +118,10 @@ student_access_col.create_index(
     [("session", ASCENDING), ("class_name", ASCENDING), ("student_id", ASCENDING)],
     unique=True
 )
+syllabus_col.create_index(
+    [("session", ASCENDING), ("class_name", ASCENDING), ("subject", ASCENDING), ("exam_name", ASCENDING), ("chapter", ASCENDING)],
+    unique=True
+)
 
 OTP_STORE = {}
 SPECIAL_OTP_USERS = {"PSPSLIB", "PSPSSTU", "PSPSTEA", "ADMIN", "PRINCIPAL"}
@@ -138,6 +145,129 @@ def normalize_sms_mobile(mobile):
     if str(mobile or "").strip().startswith("+"):
         return str(mobile).strip()
     return str(mobile or "").strip()
+
+def clean_text(value):
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+def normalize_subject_name(value):
+    return clean_text(value).upper()
+
+def normalize_exam_name(value):
+    raw = clean_text(value).upper().replace("-", " ")
+    raw = re.sub(r"\s+", " ", raw)
+    if raw.startswith("UT "):
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        if digits:
+            return f"UT{digits}"
+    return raw
+
+def syllabus_exam_sort(value):
+    exam = normalize_exam_name(value)
+    if exam.startswith("UT"):
+        digits = "".join(ch for ch in exam if ch.isdigit())
+        return int(digits) if digits else 0
+    if "HALF" in exam:
+        return 50
+    if "TERM" in exam:
+        return 60
+    if "ANNUAL" in exam or "FINAL" in exam:
+        return 99
+    return 500
+
+def syllabus_chapter_sort(value, fallback_index=0):
+    text = clean_text(value)
+    match = re.search(r"(\d+)", text)
+    if match:
+        try:
+            return int(match.group(1))
+        except Exception:
+            return fallback_index
+    return fallback_index
+
+def normalize_class_name(value):
+    raw = clean_text(value)
+    if not raw:
+        return ""
+    upper = raw.upper().replace(".", "").replace("-", " ")
+    upper = re.sub(r"\s+", " ", upper).strip()
+
+    special_map = {
+        "NURSERY": "Nursery",
+        "PRE NURSERY": "Pre Nursery",
+        "PRENURSERY": "Pre Nursery",
+        "LKG": "LKG",
+        "UKG": "UKG",
+        "KG": "KG"
+    }
+    if upper in special_map:
+        return special_map[upper]
+
+    upper = re.sub(r"^CLASS\s+", "", upper).strip()
+    match = re.fullmatch(r"(\d{1,2})(?:ST|ND|RD|TH)?", upper)
+    if match:
+        num = int(match.group(1))
+        suffix = "th"
+        if num % 100 not in (11, 12, 13):
+            if num % 10 == 1:
+                suffix = "st"
+            elif num % 10 == 2:
+                suffix = "nd"
+            elif num % 10 == 3:
+                suffix = "rd"
+        return f"{num}{suffix}"
+
+    return raw
+
+def class_sort_key(value):
+    normalized = normalize_class_name(value)
+    upper = normalized.upper()
+    special_order = {
+        "PRE NURSERY": -2,
+        "NURSERY": -1,
+        "LKG": 0,
+        "UKG": 0.5,
+        "KG": 0.75
+    }
+    if upper in special_order:
+        return (0, special_order[upper], normalized)
+    match = re.match(r"^(\d{1,2})(ST|ND|RD|TH)$", upper)
+    if match:
+        return (1, int(match.group(1)), normalized)
+    return (2, upper, normalized)
+
+def collect_known_class_names(session=""):
+    normalized = set()
+
+    def add_many(values):
+        for value in values or []:
+            cls = normalize_class_name(value)
+            if cls:
+                normalized.add(cls)
+
+    session = clean_text(session)
+
+    try:
+        add_many(timetable_col.distinct("class", {"session": session} if session else {}))
+    except Exception:
+        pass
+    try:
+        add_many(exam_subjects_col.distinct("class_name", {"session": session} if session else {}))
+    except Exception:
+        pass
+    try:
+        add_many(class_incharge_col.distinct("class_name", {"session": session} if session else {}))
+    except Exception:
+        pass
+    try:
+        student_query = {"session": session} if session else {}
+        add_many(students_col.distinct("class_name", student_query))
+    except Exception:
+        pass
+
+    if not normalized:
+        add_many([str(i) for i in range(1, 13)])
+
+    return sorted(normalized, key=class_sort_key)
 
 def find_student_teacher_profile(exam_teacher):
     if not exam_teacher:
@@ -2095,6 +2225,210 @@ def get_timetable_teachers():
 
     teachers.sort(key=lambda t: (t.get("name") or "", t.get("id") or ""))
     return jsonify({"success": True, "teachers": teachers})
+
+
+# ---------------------------
+# SYLLABUS MANAGEMENT
+# ---------------------------
+@app.route("/syllabus/download-format", methods=["GET"])
+def download_syllabus_format():
+    wb = Workbook()
+    session = clean_text(request.args.get("session"))
+    classes = collect_known_class_names(session)
+    sample_rows = [
+        ("Maths", "UT1", "Ch 1: Sample Chapter"),
+        ("Maths", "UT2", "Ch 2: Sample Chapter"),
+        ("Science", "Annual", "Ch 1: Sample Chapter")
+    ]
+
+    first = True
+    for cls in classes:
+        ws = wb.active if first else wb.create_sheet()
+        first = False
+        ws.title = str(cls)[:31]
+        ws.append(["Class", "Subject", "Exam", "Chapter"])
+        for subject, exam_name, chapter in sample_rows:
+            ws.append([cls, subject, exam_name, chapter])
+
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return send_file(
+        output,
+        as_attachment=True,
+        download_name="syllabus_upload_format.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+
+@app.route("/syllabus/import-excel", methods=["POST"])
+def import_syllabus_excel():
+    session = clean_text(request.form.get("session"))
+    file = request.files.get("file")
+    uploaded_by = clean_text(request.form.get("teacher_id") or request.form.get("uploaded_by"))
+
+    if not session:
+        return jsonify({"success": False, "message": "Session is required"}), 400
+    if not file:
+        return jsonify({"success": False, "message": "Excel file is required"}), 400
+
+    try:
+        wb = load_workbook(file, data_only=True)
+    except Exception as e:
+        return jsonify({"success": False, "message": f"Invalid Excel file: {e}"}), 400
+
+    parsed_map = {}
+    affected_classes = set()
+    skipped_rows = []
+    now_iso = datetime.utcnow().isoformat()
+
+    for ws in wb.worksheets:
+        sheet_class = normalize_class_name(ws.title)
+        for row_no, row in enumerate(ws.iter_rows(values_only=True), start=1):
+            values = [clean_text(v) for v in list(row[:4])]
+            while len(values) < 4:
+                values.append("")
+
+            class_name, subject, exam_name, chapter = values[:4]
+
+            if not any([class_name, subject, exam_name, chapter]):
+                continue
+
+            header_cells = [v.upper() for v in values[:4]]
+            if header_cells == ["CLASS", "SUBJECT", "EXAM", "CHAPTER"]:
+                continue
+
+            if not class_name:
+                class_name = sheet_class
+
+            if not class_name or not subject or not exam_name or not chapter:
+                skipped_rows.append(f"{ws.title} row {row_no}")
+                continue
+
+            class_name = normalize_class_name(class_name)
+            subject_key = normalize_subject_name(subject)
+            exam_name = normalize_exam_name(exam_name)
+            doc = {
+                "session": session,
+                "class_name": class_name,
+                "subject": subject,
+                "subject_key": subject_key,
+                "exam_name": exam_name,
+                "chapter": chapter,
+                "exam_sort": syllabus_exam_sort(exam_name),
+                "chapter_sort": syllabus_chapter_sort(chapter, row_no),
+                "sheet_name": ws.title,
+                "updated_at": now_iso
+            }
+            if uploaded_by:
+                doc["uploaded_by"] = uploaded_by
+
+            key = (session, class_name.upper(), subject_key, exam_name.upper(), chapter.upper())
+            if key not in parsed_map:
+                doc["created_at"] = now_iso
+            parsed_map[key] = doc
+            affected_classes.add(class_name)
+
+    docs = list(parsed_map.values())
+    if not docs:
+        return jsonify({
+            "success": False,
+            "message": "No valid syllabus rows found in Excel file",
+            "skipped_rows": skipped_rows
+        }), 400
+
+    for cls in affected_classes:
+        syllabus_col.delete_many({"session": session, "class_name": cls})
+
+    try:
+        syllabus_col.insert_many(docs, ordered=False)
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+    return jsonify({
+        "success": True,
+        "message": "Syllabus uploaded successfully",
+        "inserted": len(docs),
+        "affected_classes": sorted(affected_classes),
+        "skipped_rows": skipped_rows
+    })
+
+
+@app.route("/syllabus/delete", methods=["POST"])
+def delete_syllabus():
+    data = request.get_json() or {}
+    session = clean_text(data.get("session"))
+    class_name = normalize_class_name(data.get("class_name"))
+    subject = clean_text(data.get("subject"))
+
+    if not session:
+        return jsonify({"success": False, "message": "Session is required"}), 400
+
+    query = {"session": session}
+    if class_name:
+        query["class_name"] = class_name
+    if subject:
+        subject_key = normalize_subject_name(subject)
+        query["$or"] = [
+            {"subject_key": subject_key},
+            {"subject": {"$regex": f"^{re.escape(subject)}$", "$options": "i"}}
+        ]
+
+    deleted = syllabus_col.delete_many(query)
+    return jsonify({
+        "success": True,
+        "message": "Syllabus deleted successfully",
+        "deleted_count": int(deleted.deleted_count),
+        "scope": {
+            "session": session,
+            "class_name": class_name,
+            "subject": subject
+        }
+    })
+
+
+@app.route("/syllabus/list", methods=["GET"])
+def list_syllabus():
+    session = clean_text(request.args.get("session"))
+    class_name = normalize_class_name(request.args.get("class_name"))
+    subject = clean_text(request.args.get("subject"))
+
+    if not session:
+        return jsonify({"success": False, "message": "Session is required", "syllabus": []}), 400
+
+    query = {"session": session}
+    if class_name:
+        query["class_name"] = class_name
+    if subject:
+        subject_key = normalize_subject_name(subject)
+        query["$or"] = [
+            {"subject_key": subject_key},
+            {"subject": {"$regex": f"^{re.escape(subject)}$", "$options": "i"}}
+        ]
+
+    rows = []
+    cursor = syllabus_col.find(query, {"_id": 0}).sort([
+        ("class_name", ASCENDING),
+        ("subject", ASCENDING),
+        ("exam_sort", ASCENDING),
+        ("exam_name", ASCENDING),
+        ("chapter_sort", ASCENDING),
+        ("chapter", ASCENDING)
+    ])
+    for row in cursor:
+        rows.append({
+            "session": row.get("session", ""),
+            "class_name": row.get("class_name", ""),
+            "subject": row.get("subject", ""),
+            "exam_name": row.get("exam_name", ""),
+            "chapter": row.get("chapter", ""),
+            "exam_sort": row.get("exam_sort", 0),
+            "chapter_sort": row.get("chapter_sort", 0),
+            "sheet_name": row.get("sheet_name", ""),
+            "updated_at": row.get("updated_at", "")
+        })
+
+    return jsonify({"success": True, "syllabus": rows})
 
 
 @app.route("/", methods=["GET"])
