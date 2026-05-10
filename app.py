@@ -84,6 +84,9 @@ teacher_daily_work_col = db["teacher_daily_work"]
 rooms_col = db["rooms"]
 student_access_col = db["student_exam_access"]
 syllabus_col = db["syllabus"]
+teacher_duties_col = db["teacher_duties"]
+teacher_notifications_col = db["teacher_notifications"]
+seating_plans_col = db["seating_plans"]
 
 # Create useful indexes to emulate UNIQUE constraints where used in sqlite
 # Note: index creation is idempotent
@@ -122,6 +125,12 @@ syllabus_col.create_index(
     [("session", ASCENDING), ("class_name", ASCENDING), ("subject", ASCENDING), ("exam_name", ASCENDING), ("chapter", ASCENDING)],
     unique=True
 )
+teacher_duties_col.create_index([("session", ASCENDING), ("activity_key", ASCENDING), ("teacher_id", ASCENDING)])
+teacher_duties_col.create_index([("teacher_id", ASCENDING), ("session", ASCENDING), ("activity_key", ASCENDING)])
+teacher_notifications_col.create_index([("session", ASCENDING), ("teacher_id", ASCENDING), ("notification_key", ASCENDING)], unique=True)
+teacher_notifications_col.create_index([("teacher_id", ASCENDING), ("session", ASCENDING), ("created_at", ASCENDING)])
+seating_plans_col.create_index([("session", ASCENDING), ("exam_name", ASCENDING), ("exam_date", ASCENDING), ("saved_by_role", ASCENDING)])
+seating_plans_col.create_index([("session", ASCENDING), ("saved_at", ASCENDING)])
 
 OTP_STORE = {}
 SPECIAL_OTP_USERS = {"PSPSLIB", "PSPSSTU", "PSPSTEA", "ADMIN", "PRINCIPAL"}
@@ -217,6 +226,84 @@ def normalize_class_name(value):
         return f"{num}{suffix}"
 
     return raw
+
+
+TEACHER_DUTY_ACTIVITIES = [
+    {"key": "exam_seating_plan", "title": "Exam Seating Plan Making"},
+    {"key": "room_details", "title": "Room Details Fill"},
+    {"key": "exam_paper_allotment", "title": "Exam Paper Allotment"},
+    {"key": "invigilation_duties", "title": "Teachers Duties in Seating Plan"},
+    {"key": "attendance_compilation", "title": "Attendance and Absentee Compilation"},
+    {"key": "result_file_checking", "title": "Result File Checking"},
+]
+TEACHER_DUTY_ACTIVITY_MAP = {item["key"]: item["title"] for item in TEACHER_DUTY_ACTIVITIES}
+
+
+def serialize_teacher_duty(row):
+    assigned_at = row.get("assigned_at")
+    updated_at = row.get("updated_at")
+    return {
+        "id": str(row.get("_id")),
+        "session": row.get("session", ""),
+        "activity_key": row.get("activity_key", ""),
+        "activity_title": row.get("activity_title", ""),
+        "teacher_id": row.get("teacher_id", ""),
+        "teacher_name": row.get("teacher_name", ""),
+        "title": row.get("title", ""),
+        "description": row.get("description", ""),
+        "exam_name": row.get("exam_name", ""),
+        "room_no": row.get("room_no", ""),
+        "duty_date": row.get("duty_date", ""),
+        "due_date": row.get("due_date", ""),
+        "status": row.get("status", "assigned"),
+        "assigned_by": row.get("assigned_by", ""),
+        "assigned_at": assigned_at.isoformat() if isinstance(assigned_at, datetime) else "",
+        "updated_at": updated_at.isoformat() if isinstance(updated_at, datetime) else "",
+    }
+
+
+def serialize_teacher_notification(row):
+    created_at = row.get("created_at")
+    updated_at = row.get("updated_at")
+    return {
+        "id": str(row.get("_id")),
+        "session": row.get("session", ""),
+        "teacher_id": row.get("teacher_id", ""),
+        "teacher_name": row.get("teacher_name", ""),
+        "notification_key": row.get("notification_key", ""),
+        "title": row.get("title", ""),
+        "message": row.get("message", ""),
+        "activity_key": row.get("activity_key", ""),
+        "activity_title": row.get("activity_title", ""),
+        "exam_name": row.get("exam_name", ""),
+        "room_no": row.get("room_no", ""),
+        "duty_date": row.get("duty_date", ""),
+        "assigned_by": row.get("assigned_by", ""),
+        "source_duty_id": row.get("source_duty_id", ""),
+        "created_at": created_at.isoformat() if isinstance(created_at, datetime) else "",
+        "updated_at": updated_at.isoformat() if isinstance(updated_at, datetime) else "",
+    }
+
+
+def serialize_seating_plan(row):
+    saved_at = row.get("saved_at")
+    updated_at = row.get("updated_at")
+    return {
+        "id": str(row.get("_id")),
+        "session": row.get("session", ""),
+        "exam_name": row.get("exam_name", ""),
+        "exam_date": row.get("exam_date", ""),
+        "selected_classes": row.get("selected_classes", []),
+        "assignment_rows": row.get("assignment_rows", []),
+        "saved_by_role": row.get("saved_by_role", ""),
+        "saved_by_name": row.get("saved_by_name", ""),
+        "saved_by_id": row.get("saved_by_id", ""),
+        "teacher_duty_id": row.get("teacher_duty_id", ""),
+        "teacher_duty_title": row.get("teacher_duty_title", ""),
+        "notes": row.get("notes", ""),
+        "saved_at": saved_at.isoformat() if isinstance(saved_at, datetime) else "",
+        "updated_at": updated_at.isoformat() if isinstance(updated_at, datetime) else "",
+    }
 
 def class_sort_key(value):
     normalized = normalize_class_name(value)
@@ -1636,7 +1723,13 @@ def list_teachers():
         return jsonify({"success": False, "message": "Missing session"}), 400
     rows = []
     for r in teachers_col.find({"session": session}):
-        rows.append({"id": str(r.get("_id")), "username": r.get("username"), "name": r.get("name")})
+        rows.append({
+            "id": str(r.get("_id")),
+            "teacher_id": r.get("teacher_id", ""),
+            "username": r.get("username"),
+            "name": r.get("name"),
+            "session": r.get("session", "")
+        })
     return jsonify({"success": True, "teachers": rows})
 
 @app.route("/teacher/delete/<teacher_id>", methods=["DELETE"])
@@ -2804,10 +2897,26 @@ def save_room():
     data = request.get_json() or {}
     session = (data.get("session") or "").strip()
     room_no = (data.get("room_no") or "").strip()
-    rows = int(data.get("rows") or 0)
-    benches_per_row = int(data.get("benches_per_row") or 0)
+    raw_bench_rows = data.get("bench_rows")
+    bench_rows = []
+    if isinstance(raw_bench_rows, list):
+        for item in raw_bench_rows:
+            try:
+                value = int(item or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                bench_rows.append(value)
+    rows = int(data.get("rows") or len(bench_rows) or 0)
+    benches_per_row = int(data.get("benches_per_row") or (max(bench_rows) if bench_rows else 0) or 0)
     seats_per_bench = int(data.get("seats_per_bench") or 0)
-    if not session or not room_no or rows <= 0 or benches_per_row <= 0 or seats_per_bench <= 0:
+    if bench_rows:
+        rows = len(bench_rows)
+        benches_per_row = max(bench_rows)
+    elif rows > 0 and benches_per_row > 0:
+        bench_rows = [benches_per_row for _ in range(rows)]
+
+    if not session or not room_no or rows <= 0 or benches_per_row <= 0 or seats_per_bench <= 0 or not bench_rows:
         return jsonify({"success": False, "message": "Invalid room data"}), 400
 
     rooms_col.update_one(
@@ -2817,6 +2926,7 @@ def save_room():
             "room_no": room_no,
             "rows": rows,
             "benches_per_row": benches_per_row,
+            "bench_rows": bench_rows,
             "seats_per_bench": seats_per_bench,
             "updated_at": datetime.utcnow()
         }, "$setOnInsert": {"created_at": datetime.utcnow()}},
@@ -2834,6 +2944,326 @@ def delete_room():
         return jsonify({"success": False, "message": "Missing session/room"}), 400
     rooms_col.delete_one({"session": session, "room_no": room_no})
     return jsonify({"success": True, "message": "Room deleted"})
+
+
+# ----------------------------
+# Teacher Duty Management
+# ----------------------------
+@app.route("/teacher-duty/activities", methods=["GET"])
+def list_teacher_duty_activities():
+    return jsonify({"success": True, "activities": TEACHER_DUTY_ACTIVITIES})
+
+
+@app.route("/teacher-duty/list", methods=["GET"])
+def list_teacher_duties():
+    session = clean_text(request.args.get("session"))
+    activity_key = clean_text(request.args.get("activity_key"))
+    teacher_id = clean_text(request.args.get("teacher_id"))
+
+    query = {}
+    if session:
+        query["session"] = session
+    if activity_key:
+        query["activity_key"] = activity_key
+    if teacher_id:
+        query["teacher_id"] = teacher_id
+
+    rows = [
+        serialize_teacher_duty(r)
+        for r in teacher_duties_col.find(query).sort([
+            ("activity_title", ASCENDING),
+            ("teacher_name", ASCENDING),
+            ("assigned_at", -1)
+        ])
+    ]
+    return jsonify({"success": True, "duties": rows})
+
+
+@app.route("/teacher-duty/save", methods=["POST"])
+def save_teacher_duty():
+    data = request.get_json() or {}
+    duty_id = clean_text(data.get("id"))
+    session = clean_text(data.get("session"))
+    activity_key = clean_text(data.get("activity_key"))
+    teacher_id = clean_text(data.get("teacher_id"))
+    teacher_name = clean_text(data.get("teacher_name"))
+    title = clean_text(data.get("title"))
+    description = clean_text(data.get("description"))
+    exam_name = clean_text(data.get("exam_name"))
+    room_no = clean_text(data.get("room_no"))
+    duty_date = clean_text(data.get("duty_date"))
+    due_date = clean_text(data.get("due_date"))
+    status = clean_text(data.get("status")) or "assigned"
+    assigned_by = clean_text(data.get("assigned_by")) or "Admin"
+
+    if not session or not activity_key or not teacher_id or not title:
+        return jsonify({"success": False, "message": "Missing required duty fields"}), 400
+
+    activity_title = TEACHER_DUTY_ACTIVITY_MAP.get(activity_key) or clean_text(data.get("activity_title")) or "Teacher Duty"
+
+    if not teacher_name:
+        teacher_doc = teachers_col.find_one({"session": session, "teacher_id": teacher_id})
+        if not teacher_doc:
+            teacher_doc = teachers_col.find_one({"teacher_id": teacher_id})
+        teacher_name = clean_text(teacher_doc.get("name") if teacher_doc else "")
+
+    payload = {
+        "session": session,
+        "activity_key": activity_key,
+        "activity_title": activity_title,
+        "teacher_id": teacher_id,
+        "teacher_name": teacher_name,
+        "title": title,
+        "description": description,
+        "exam_name": exam_name,
+        "room_no": room_no,
+        "duty_date": duty_date,
+        "due_date": due_date,
+        "status": status,
+        "assigned_by": assigned_by,
+        "updated_at": datetime.utcnow(),
+    }
+
+    try:
+        if duty_id:
+            result = teacher_duties_col.update_one(
+                {"_id": ObjectId(duty_id)},
+                {"$set": payload}
+            )
+            if result.matched_count == 0:
+                return jsonify({"success": False, "message": "Duty not found"}), 404
+            saved = teacher_duties_col.find_one({"_id": ObjectId(duty_id)})
+        else:
+            payload["assigned_at"] = datetime.utcnow()
+            result = teacher_duties_col.insert_one(payload)
+            saved = teacher_duties_col.find_one({"_id": result.inserted_id})
+        return jsonify({"success": True, "message": "Duty saved", "duty": serialize_teacher_duty(saved)})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+@app.route("/teacher-duty/delete/<duty_id>", methods=["DELETE"])
+def delete_teacher_duty(duty_id):
+    try:
+        result = teacher_duties_col.delete_one({"_id": ObjectId(duty_id)})
+    except Exception:
+        result = None
+    if not result or result.deleted_count == 0:
+        return jsonify({"success": False, "message": "Duty not found"}), 404
+    return jsonify({"success": True, "message": "Duty deleted"})
+
+
+@app.route("/teacher-notification/list", methods=["GET"])
+def list_teacher_notifications():
+    session = clean_text(request.args.get("session"))
+    teacher_id = clean_text(request.args.get("teacher_id"))
+
+    query = {}
+    if session:
+        query["session"] = session
+    if teacher_id:
+        query["teacher_id"] = teacher_id
+
+    rows = [
+        serialize_teacher_notification(r)
+        for r in teacher_notifications_col.find(query).sort([
+            ("updated_at", -1),
+            ("created_at", -1)
+        ])
+    ]
+    return jsonify({"success": True, "notifications": rows})
+
+
+@app.route("/teacher-notification/save", methods=["POST"])
+def save_teacher_notification():
+    data = request.get_json() or {}
+    session = clean_text(data.get("session"))
+    teacher_id = clean_text(data.get("teacher_id"))
+    teacher_name = clean_text(data.get("teacher_name"))
+    notification_key = clean_text(data.get("notification_key"))
+    title = clean_text(data.get("title"))
+    message = clean_text(data.get("message"))
+    activity_key = clean_text(data.get("activity_key"))
+    activity_title = clean_text(data.get("activity_title"))
+    exam_name = clean_text(data.get("exam_name"))
+    room_no = clean_text(data.get("room_no"))
+    duty_date = clean_text(data.get("duty_date"))
+    assigned_by = clean_text(data.get("assigned_by")) or "Teacher"
+    source_duty_id = clean_text(data.get("source_duty_id"))
+
+    if not session or not teacher_id or not notification_key or not title:
+        return jsonify({"success": False, "message": "Missing required notification fields"}), 400
+
+    if not teacher_name:
+        teacher_doc = teachers_col.find_one({"session": session, "teacher_id": teacher_id})
+        if not teacher_doc:
+            teacher_doc = teachers_col.find_one({"teacher_id": teacher_id})
+        teacher_name = clean_text(teacher_doc.get("name") if teacher_doc else "")
+
+    payload = {
+        "session": session,
+        "teacher_id": teacher_id,
+        "teacher_name": teacher_name,
+        "notification_key": notification_key,
+        "title": title,
+        "message": message,
+        "activity_key": activity_key,
+        "activity_title": activity_title,
+        "exam_name": exam_name,
+        "room_no": room_no,
+        "duty_date": duty_date,
+        "assigned_by": assigned_by,
+        "source_duty_id": source_duty_id,
+        "updated_at": datetime.utcnow(),
+    }
+
+    try:
+        teacher_notifications_col.update_one(
+            {
+                "session": session,
+                "teacher_id": teacher_id,
+                "notification_key": notification_key,
+            },
+            {
+                "$set": payload,
+                "$setOnInsert": {"created_at": datetime.utcnow()},
+            },
+            upsert=True
+        )
+        saved = teacher_notifications_col.find_one({
+            "session": session,
+            "teacher_id": teacher_id,
+            "notification_key": notification_key,
+        })
+        return jsonify({"success": True, "message": "Notification saved", "notification": serialize_teacher_notification(saved)})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+@app.route("/teacher-notification/delete/<notification_id>", methods=["DELETE"])
+def delete_teacher_notification(notification_id):
+    try:
+        result = teacher_notifications_col.delete_one({"_id": ObjectId(notification_id)})
+    except Exception:
+        result = None
+    if not result or result.deleted_count == 0:
+        return jsonify({"success": False, "message": "Notification not found"}), 404
+    return jsonify({"success": True, "message": "Notification deleted"})
+
+
+@app.route("/seating-plan/list", methods=["GET"])
+def list_seating_plans():
+    session = clean_text(request.args.get("session"))
+    exam_name = clean_text(request.args.get("exam_name"))
+    exam_date = clean_text(request.args.get("exam_date"))
+    saved_by_role = clean_text(request.args.get("saved_by_role"))
+    saved_by_id = clean_text(request.args.get("saved_by_id"))
+
+    query = {}
+    if session:
+        query["session"] = session
+    if exam_name:
+        query["exam_name"] = exam_name
+    if exam_date:
+        query["exam_date"] = exam_date
+    if saved_by_role:
+        query["saved_by_role"] = saved_by_role
+    if saved_by_id:
+        query["saved_by_id"] = saved_by_id
+
+    rows = [
+        serialize_seating_plan(r)
+        for r in seating_plans_col.find(query).sort([
+            ("exam_date", ASCENDING),
+            ("exam_name", ASCENDING),
+            ("saved_at", -1)
+        ])
+    ]
+    return jsonify({"success": True, "plans": rows})
+
+
+@app.route("/seating-plan/delete/<plan_id>", methods=["DELETE"])
+def delete_seating_plan(plan_id):
+    try:
+        result = seating_plans_col.delete_one({"_id": ObjectId(plan_id)})
+    except Exception:
+        result = None
+    if not result or result.deleted_count == 0:
+        return jsonify({"success": False, "message": "Seating plan not found"}), 404
+    return jsonify({"success": True, "message": "Seating plan deleted"})
+
+
+@app.route("/seating-plan/save", methods=["POST"])
+def save_seating_plan():
+    data = request.get_json() or {}
+    plan_id = clean_text(data.get("id"))
+    session = clean_text(data.get("session"))
+    exam_name = clean_text(data.get("exam_name"))
+    exam_date = clean_text(data.get("exam_date"))
+    saved_by_role = clean_text(data.get("saved_by_role")) or "Admin"
+    saved_by_name = clean_text(data.get("saved_by_name"))
+    saved_by_id = clean_text(data.get("saved_by_id"))
+    teacher_duty_id = clean_text(data.get("teacher_duty_id"))
+    teacher_duty_title = clean_text(data.get("teacher_duty_title"))
+    notes = clean_text(data.get("notes"))
+    selected_classes = data.get("selected_classes") if isinstance(data.get("selected_classes"), list) else []
+    raw_assignment_rows = data.get("assignment_rows") if isinstance(data.get("assignment_rows"), list) else []
+
+    assignment_rows = []
+    for row in raw_assignment_rows:
+        if not isinstance(row, dict):
+            continue
+        class_name = clean_text(row.get("className") or row.get("class_name"))
+        subject = clean_text(row.get("subject"))
+        room_no = clean_text(row.get("roomNo") or row.get("room_no"))
+        try:
+            student_count = int(row.get("studentCount") or row.get("student_count") or 0)
+        except (TypeError, ValueError):
+            student_count = 0
+        if class_name and room_no:
+            assignment_rows.append({
+                "className": class_name,
+                "subject": subject,
+                "studentCount": student_count,
+                "roomNo": room_no,
+            })
+
+    selected_classes = [clean_text(item) for item in selected_classes if clean_text(item)]
+
+    if not session or not exam_name or not exam_date or not assignment_rows:
+        return jsonify({"success": False, "message": "Missing seating plan fields"}), 400
+
+    payload = {
+        "session": session,
+        "exam_name": exam_name,
+        "exam_date": exam_date,
+        "selected_classes": selected_classes,
+        "assignment_rows": assignment_rows,
+        "saved_by_role": saved_by_role,
+        "saved_by_name": saved_by_name,
+        "saved_by_id": saved_by_id,
+        "teacher_duty_id": teacher_duty_id,
+        "teacher_duty_title": teacher_duty_title,
+        "notes": notes,
+        "updated_at": datetime.utcnow(),
+    }
+
+    try:
+        if plan_id:
+            result = seating_plans_col.update_one(
+                {"_id": ObjectId(plan_id)},
+                {"$set": payload}
+            )
+            if result.matched_count == 0:
+                return jsonify({"success": False, "message": "Seating plan not found"}), 404
+            saved = seating_plans_col.find_one({"_id": ObjectId(plan_id)})
+        else:
+            payload["saved_at"] = datetime.utcnow()
+            result = seating_plans_col.insert_one(payload)
+            saved = seating_plans_col.find_one({"_id": result.inserted_id})
+        return jsonify({"success": True, "message": "Seating plan saved", "plan": serialize_seating_plan(saved)})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
 
 # =========================
 # HOLIDAY MANAGEMENT
