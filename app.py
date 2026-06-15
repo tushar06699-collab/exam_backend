@@ -87,6 +87,7 @@ syllabus_col = db["syllabus"]
 teacher_duties_col = db["teacher_duties"]
 teacher_notifications_col = db["teacher_notifications"]
 seating_plans_col = db["seating_plans"]
+grievances_col = db["student_grievances"]
 
 # Create useful indexes to emulate UNIQUE constraints where used in sqlite
 # Note: index creation is idempotent
@@ -131,6 +132,8 @@ teacher_notifications_col.create_index([("session", ASCENDING), ("teacher_id", A
 teacher_notifications_col.create_index([("teacher_id", ASCENDING), ("session", ASCENDING), ("created_at", ASCENDING)])
 seating_plans_col.create_index([("session", ASCENDING), ("exam_name", ASCENDING), ("exam_date", ASCENDING), ("saved_by_role", ASCENDING)])
 seating_plans_col.create_index([("session", ASCENDING), ("saved_at", ASCENDING)])
+grievances_col.create_index([("student_id", ASCENDING), ("submitted_at", ASCENDING)])
+grievances_col.create_index([("session", ASCENDING), ("status", ASCENDING), ("submitted_at", ASCENDING)])
 
 OTP_STORE = {}
 SPECIAL_OTP_USERS = {"PSPSLIB", "PSPSSTU", "PSPSTEA", "ADMIN", "PRINCIPAL"}
@@ -2649,6 +2652,78 @@ def get_notice_file(filename):
     if os.path.exists(filepath):
         return send_file(filepath)
     return "File Not Found", 404
+
+def grievance_to_dict(g):
+    submitted = g.get("submitted_at")
+    updated = g.get("updated_at")
+    return {
+        "id": str(g.get("_id", "")),
+        "student_id": str(g.get("student_id", "")),
+        "student_name": g.get("student_name", ""),
+        "admission_no": g.get("admission_no", ""),
+        "class_name": g.get("class_name", ""),
+        "roll": g.get("roll", ""),
+        "session": g.get("session", ""),
+        "category": g.get("category", ""),
+        "type": g.get("type", ""),
+        "subject": g.get("subject", ""),
+        "description": g.get("description", ""),
+        "status": g.get("status", "Submitted"),
+        "admin_note": g.get("admin_note", ""),
+        "submitted_at": submitted.isoformat() if hasattr(submitted, "isoformat") else str(submitted or ""),
+        "updated_at": updated.isoformat() if hasattr(updated, "isoformat") else str(updated or ""),
+    }
+
+@app.route("/grievance/submit", methods=["POST"])
+def submit_grievance():
+    data = request.get_json(silent=True) or {}
+    student_id = str(data.get("student_id", "") or "").strip()
+    category = str(data.get("category", "") or "").strip()
+    gtype = str(data.get("type", "") or "").strip()
+    subject = str(data.get("subject", "") or "").strip()
+    description = str(data.get("description", "") or "").strip()
+
+    if not student_id:
+        return jsonify({"success": False, "message": "Missing student_id"}), 400
+    if not category or not gtype or not subject or not description:
+        return jsonify({"success": False, "message": "Category, type, subject and description are required"}), 400
+
+    student = None
+    try:
+        student = students_col.find_one({"_id": ObjectId(student_id)})
+    except Exception:
+        student = None
+
+    doc = {
+        "student_id": student_id,
+        "student_name": str(data.get("student_name") or (student or {}).get("student_name") or "").strip(),
+        "admission_no": str(data.get("admission_no") or (student or {}).get("admission_no") or "").strip(),
+        "class_name": str(data.get("class_name") or (student or {}).get("class_name") or "").strip(),
+        "roll": str(data.get("roll") or (student or {}).get("rollno") or "").strip(),
+        "session": str(data.get("session") or (student or {}).get("session") or "").strip(),
+        "category": category,
+        "type": gtype,
+        "subject": subject,
+        "description": description,
+        "status": "Submitted",
+        "admin_note": "",
+        "submitted_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
+    }
+    res = grievances_col.insert_one(doc)
+    doc["_id"] = res.inserted_id
+    return jsonify({"success": True, "message": "Grievance submitted", "grievance": grievance_to_dict(doc)})
+
+@app.route("/grievance/student/<student_id>", methods=["GET"])
+def student_grievances(student_id):
+    sid = str(student_id or "").strip()
+    session = str(request.args.get("session", "") or "").strip()
+    query = {"student_id": sid}
+    if session:
+        query["session"] = session
+    rows = [grievance_to_dict(g) for g in grievances_col.find(query).sort("submitted_at", -1)]
+    return jsonify({"success": True, "grievances": rows})
+
 @app.route("/notice/delete/<notice_id>", methods=["DELETE"])
 def delete_notice(notice_id):
     try:
