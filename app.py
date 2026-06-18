@@ -88,6 +88,7 @@ teacher_duties_col = db["teacher_duties"]
 teacher_notifications_col = db["teacher_notifications"]
 seating_plans_col = db["seating_plans"]
 grievances_col = db["student_grievances"]
+certificate_access_col = db["certificate_access"]
 
 # Create useful indexes to emulate UNIQUE constraints where used in sqlite
 # Note: index creation is idempotent
@@ -134,6 +135,10 @@ seating_plans_col.create_index([("session", ASCENDING), ("exam_name", ASCENDING)
 seating_plans_col.create_index([("session", ASCENDING), ("saved_at", ASCENDING)])
 grievances_col.create_index([("student_id", ASCENDING), ("submitted_at", ASCENDING)])
 grievances_col.create_index([("session", ASCENDING), ("status", ASCENDING), ("submitted_at", ASCENDING)])
+certificate_access_col.create_index(
+    [("session", ASCENDING), ("class_name", ASCENDING), ("student_id", ASCENDING), ("certificate_type", ASCENDING)],
+    unique=True
+)
 
 OTP_STORE = {}
 SPECIAL_OTP_USERS = {"PSPSLIB", "PSPSSTU", "PSPSTEA", "ADMIN", "PRINCIPAL"}
@@ -1164,6 +1169,173 @@ def student_access_save():
         saved += 1
 
     return jsonify({"success": True, "message": "Student access settings saved", "saved": saved})
+
+
+CERTIFICATE_TYPES = ["bonafide", "character", "study", "tc"]
+
+
+def certificate_permission_key(value):
+    text = clean_text(value).lower()
+    aliases = {
+        "transfer": "tc",
+        "transfer_certificate": "tc",
+        "certificate_tc": "tc",
+        "certificate_bonafide": "bonafide",
+        "certificate_character": "character",
+        "certificate_study": "study",
+    }
+    return aliases.get(text, text)
+
+
+def find_student_for_certificate_permission(session, class_name, student_id="", admission_no=""):
+    sessions = session_variants(session)
+    query = {}
+    if sessions:
+        query["session"] = {"$in": sessions}
+    if class_name:
+        query["class_name"] = class_name
+
+    if student_id:
+        try:
+            student = students_col.find_one({"_id": ObjectId(student_id)})
+            if student:
+                return student
+        except Exception:
+            pass
+
+    if admission_no:
+        variants = [admission_no, str(admission_no).strip()]
+        try:
+            variants.append(int(str(admission_no).strip()))
+        except Exception:
+            pass
+        student = students_col.find_one({**query, "admission_no": {"$in": variants}})
+        if student:
+            return student
+        student = students_col.find_one({"admission_no": {"$in": variants}})
+        if student:
+            return student
+
+    return None
+
+
+@app.route("/certificate-access/list", methods=["GET"])
+def certificate_access_list():
+    session = clean_text(request.args.get("session"))
+    class_name = clean_text(request.args.get("class_name"))
+    if not session or not class_name:
+        return jsonify({"success": False, "message": "Missing parameters", "students": []}), 400
+
+    sessions = session_variants(session)
+    students = list(students_col.find({"session": {"$in": sessions}, "class_name": class_name}))
+    if not students:
+        students = list(students_col.find({"class_name": class_name}))
+
+    docs = list(certificate_access_col.find({"session": {"$in": sessions}, "class_name": class_name}))
+    access_map = {}
+    for doc in docs:
+        key = (doc.get("student_id"), doc.get("certificate_type"))
+        if key not in access_map:
+            access_map[key] = doc
+
+    def roll_num(s):
+        try:
+            return int(str(s.get("rollno", "")).strip())
+        except Exception:
+            return 10**9
+
+    out = []
+    for student in sorted(students, key=roll_num):
+        sid = str(student.get("_id"))
+        permissions = {}
+        for cert_type in CERTIFICATE_TYPES:
+            doc = access_map.get((sid, cert_type), {})
+            permissions[cert_type] = to_bool(doc.get("allowed"), False)
+
+        out.append({
+            "student_id": sid,
+            "admission_no": student.get("admission_no", ""),
+            "name": student.get("student_name", "") or student.get("name", ""),
+            "father_name": student.get("father_name", ""),
+            "class_name": student.get("class_name", ""),
+            "section": student.get("section", ""),
+            "rollno": student.get("rollno", ""),
+            "permissions": permissions,
+        })
+
+    return jsonify({"success": True, "students": out, "certificate_types": CERTIFICATE_TYPES})
+
+
+@app.route("/certificate-access/save", methods=["POST"])
+def certificate_access_save():
+    data = request.get_json() or {}
+    session = clean_text(data.get("session"))
+    class_name = clean_text(data.get("class_name"))
+    students = data.get("students", [])
+    if not session or not class_name or not isinstance(students, list):
+        return jsonify({"success": False, "message": "Missing data"}), 400
+
+    sessions = session_variants(session)
+    saved = 0
+    for row in students:
+        sid = clean_text(row.get("student_id"))
+        permissions = row.get("permissions") if isinstance(row.get("permissions"), dict) else {}
+        if not sid:
+            continue
+
+        for cert_type in CERTIFICATE_TYPES:
+            allowed = to_bool(permissions.get(cert_type), False)
+            for sess in sessions:
+                certificate_access_col.update_one(
+                    {
+                        "session": sess,
+                        "class_name": class_name,
+                        "student_id": sid,
+                        "certificate_type": cert_type,
+                    },
+                    {
+                        "$set": {
+                            "allowed": allowed,
+                            "updated_at": datetime.utcnow(),
+                        }
+                    },
+                    upsert=True,
+                )
+            saved += 1
+
+    return jsonify({"success": True, "message": "Certificate permissions saved", "saved": saved})
+
+
+@app.route("/certificate-access/check", methods=["GET"])
+def certificate_access_check():
+    session = clean_text(request.args.get("session"))
+    class_name = clean_text(request.args.get("class_name"))
+    admission_no = clean_text(request.args.get("admission_no"))
+    student_id = clean_text(request.args.get("student_id"))
+    cert_type = certificate_permission_key(request.args.get("certificate_type"))
+    if cert_type not in CERTIFICATE_TYPES:
+        return jsonify({"success": False, "allowed": False, "message": "Invalid certificate type"}), 400
+
+    student = find_student_for_certificate_permission(session, class_name, student_id, admission_no)
+    if not student:
+        return jsonify({"success": True, "allowed": False, "reason": "student_not_found"})
+
+    sid = str(student.get("_id"))
+    sessions = session_variants(session or student.get("session", ""))
+    doc = certificate_access_col.find_one({
+        "session": {"$in": sessions},
+        "class_name": class_name or student.get("class_name", ""),
+        "student_id": sid,
+        "certificate_type": cert_type,
+    })
+
+    return jsonify({
+        "success": True,
+        "allowed": to_bool(doc.get("allowed"), False) if doc else False,
+        "reason": "allowed" if doc and to_bool(doc.get("allowed"), False) else "permission_required",
+        "student_id": sid,
+        "certificate_type": cert_type,
+    })
 
 # ---------------------------
 # debug datesheet (show collection's keys info)
