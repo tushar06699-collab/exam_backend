@@ -395,6 +395,7 @@ def find_student_teacher_profile(exam_teacher):
         "photo_url": str((profile or {}).get("photo_url", "")).strip(),
         "dob": str((profile or {}).get("dob", "")).strip() or str((profile or {}).get("date_of_birth", "")).strip(),
         "teacher_code": str((profile or {}).get("teacher_code", "")).strip(),
+        "designation": str((profile or {}).get("designation", "")).strip() or str((profile or {}).get("department", "")).strip(),
     }
 
 def get_teacher_profile_payload(username):
@@ -1065,6 +1066,15 @@ def portal_list_students():
             "class_name": s.get("class_name"),
             "section": s.get("section"),
             "roll": roll_value,
+            "father_name": s.get("father_name", ""),
+            "mother_name": s.get("mother_name", ""),
+            "dob": s.get("dob", "") or s.get("date_of_birth", ""),
+            "gender": s.get("gender", "") or s.get("sex", ""),
+            "phone": s.get("phone", "") or s.get("mobile", "") or s.get("contact_no", ""),
+            "mobile": s.get("mobile", ""),
+            "parent_mobile": s.get("parent_mobile", "") or s.get("father_phone", "") or s.get("guardian_phone", ""),
+            "address": s.get("address", ""),
+            "aadhar_no": s.get("aadhar_no", "") or s.get("aadharno", ""),
             "photo_url": s.get("photo_url", ""),
             "session": s.get("session"),
             "eligible": access.get("eligible", False),
@@ -1903,6 +1913,7 @@ def list_teachers():
             "teacher_id": r.get("teacher_id", ""),
             "username": r.get("username"),
             "name": r.get("name"),
+            "designation": r.get("designation", ""),
             "session": r.get("session", "")
         })
     return jsonify({"success": True, "teachers": rows})
@@ -1954,6 +1965,7 @@ def get_teacher(teacher_id):
             "teacher_id": teacher.get("teacher_id"),
             "name": teacher.get("name"),
             "username": teacher.get("username"),
+            "designation": teacher.get("designation", ""),
             "session": teacher.get("session")
         })
     else:
@@ -2273,6 +2285,7 @@ def login():
                     "teacher_id": teacher.get("teacher_id", ""),
                     "name": teacher.get("name"),
                     "username": teacher.get("username"),
+                    "designation": teacher.get("designation", "") or profile.get("designation", ""),
                     "session": teacher.get("session")
                 }
             })
@@ -2943,9 +2956,23 @@ def save_attendance():
     class_name = data.get("class_name")
     date = data.get("date")
     attendance_list = data.get("attendance", [])
+    final_submitted = bool(data.get("final_submitted"))
+    submitted_by_role = str(data.get("submitted_by_role", "teacher")).strip().lower()
 
     if not session or not class_name or not date or not attendance_list:
         return jsonify({"success": False, "message": "Missing fields"}), 400
+
+    existing_final = attendance_col.find_one({
+        "session": session,
+        "class_name": class_name,
+        "date": date,
+        "final_submitted": True
+    })
+    if existing_final and submitted_by_role not in ["admin", "principal", "director", "management"]:
+        return jsonify({
+            "success": False,
+            "message": "Record already submitted. Contact admin to change attendance."
+        }), 409
 
     # Remove old attendance for same class+date
     attendance_col.delete_many({"session": session, "class_name": class_name, "date": date})
@@ -2965,7 +2992,10 @@ def save_attendance():
                 "student_id": student_id,
                 "student_roll": str(student_roll or "").strip(),
                 "student_admission": str(student_admission or "").strip(),
-                "status": status
+                "status": status,
+                "final_submitted": final_submitted,
+                "submitted_by_role": submitted_by_role,
+                "submitted_at": datetime.utcnow()
             })
 
     if to_insert:
@@ -2999,10 +3029,15 @@ def list_attendance():
             "student_id": sid,
             "student_roll": att.get("student_roll", ""),
             "student_admission": att.get("student_admission", ""),
-            "status": att.get("status")
+            "status": att.get("status"),
+            "final_submitted": bool(att.get("final_submitted"))
         })
 
-    return jsonify({"success": True, "attendance": records})
+    return jsonify({
+        "success": True,
+        "attendance": records,
+        "final_submitted": any(bool(r.get("final_submitted")) for r in records)
+    })
 
 
 # ---------------------------
