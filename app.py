@@ -17,6 +17,8 @@ from pymongo import MongoClient
 from email.mime.text import MIMEText
 from openpyxl import Workbook, load_workbook
 
+import jwt as pyjwt
+
 def _load_dotenv_simple():
     # Load .env without extra dependency; process env already-set values take precedence.
     candidates = [
@@ -66,6 +68,20 @@ student_client = MongoClient(STUDENT_MONGO_URI)
 student_db = student_client["school_erp"]
 students_col = student_db["students"]
 student_teachers_col = student_db["teachers"]
+
+# --------------------------------------------------------
+# MongoDB (FEE / ERP DATABASE ONLY - read-only for students)
+# --------------------------------------------------------
+FEE_MONGO_URI = os.environ.get(
+    "FEE_MONGO_URI",
+    "mongodb+srv://jlwajlwa069_db_user:qXfDV7oKGUcobg0T@cluster0.rgodpt1.mongodb.net/?appName=Cluster0"
+)
+fee_db = None
+try:
+    fee_client = MongoClient(FEE_MONGO_URI, serverSelectionTimeoutMS=8000)
+    fee_db = fee_client["school_erp"]
+except Exception:
+    fee_db = None
 
 
 # Collections (mirror of your sqlite tables)
@@ -402,7 +418,7 @@ def get_teacher_profile_payload(username):
     username_u = str(username or "").strip().upper()
     if not username_u:
         return None, None, None
-    teacher = teachers_col.find_one({"username": username_u})
+    teacher = find_exam_teacher_for_login(username_u)
     if not teacher:
         return None, None, None
     profile = find_student_teacher_profile(teacher)
@@ -413,6 +429,123 @@ def get_teacher_profile_payload(username):
         "mobile_masked": mask_mobile(profile.get("mobile", ""))
     }
     return teacher, profile, teacher_payload
+
+def _teacher_code4(value):
+    digits = re.sub(r"\D", "", str(value or ""))
+    return digits.zfill(4)[-4:] if digits else ""
+
+def find_student_teacher_profile_for_login(username):
+    username_u = str(username or "").strip().upper()
+    if not username_u:
+        return None
+
+    code4 = _teacher_code4(username_u)
+    filters = [
+        {"employee_id": {"$regex": f"^{re.escape(username_u)}$", "$options": "i"}},
+        {"teacher_name": {"$regex": f"^{re.escape(username_u)}$", "$options": "i"}},
+    ]
+    if code4:
+        filters.extend([
+            {"teacher_code": code4},
+            {"teacher_id": code4},
+            {"employee_id": code4}
+        ])
+
+    compact_username = _normalize_teacher_name_for_password(username_u)
+    if compact_username:
+        filters.append({"teacher_name": {"$regex": re.escape(compact_username), "$options": "i"}})
+
+    for q in filters:
+        profile = student_teachers_col.find_one(q)
+        if profile:
+            return profile
+    return None
+
+def find_exam_teacher_for_login(username):
+    username_u = str(username or "").strip().upper()
+    if not username_u:
+        return None
+
+    teacher = teachers_col.find_one({"username": username_u})
+    if teacher:
+        return teacher
+
+    code4 = _teacher_code4(username_u)
+    if code4:
+        teacher = teachers_col.find_one({"teacher_id": code4})
+        if teacher:
+            return teacher
+
+    profile = find_student_teacher_profile_for_login(username_u)
+    if not profile:
+        return None
+
+    profile_code = _teacher_code4(profile.get("teacher_code") or profile.get("teacher_id"))
+    if profile_code:
+        teacher = teachers_col.find_one({"teacher_id": profile_code})
+        if teacher:
+            return teacher
+
+    emp = str(profile.get("employee_id") or "").strip().upper()
+    if emp:
+        teacher = teachers_col.find_one({"username": emp})
+        if teacher:
+            return teacher
+
+    profile_name = str(profile.get("teacher_name") or "").strip()
+    if profile_name:
+        teacher = teachers_col.find_one({"name": {"$regex": f"^{re.escape(profile_name)}$", "$options": "i"}})
+        if teacher:
+            return teacher
+
+    return None
+
+def ensure_exam_teacher_from_profile(username, profile):
+    if not profile:
+        return None
+
+    existing = find_exam_teacher_for_login(username)
+    if existing:
+        return existing
+
+    session = str(profile.get("session") or "").strip() or "2026_27"
+    teacher_name = str(profile.get("teacher_name") or username or "Teacher").strip()
+    teacher_code = _teacher_code4(profile.get("teacher_code") or profile.get("teacher_id"))
+    username_u = str(username or profile.get("employee_id") or "").strip().upper()
+    if not username_u:
+        username_u = (_normalize_teacher_name_for_password(teacher_name)[:8] or "TEACHER") + (teacher_code or "")
+
+    if not teacher_code:
+        last_teacher = list(teachers_col.find({"session": session}).sort("teacher_id", -1).limit(1))
+        last_id = 0
+        if last_teacher:
+            try:
+                last_id = int(last_teacher[0].get("teacher_id", 0))
+            except Exception:
+                last_id = 0
+        teacher_code = f"{last_id + 1:04d}"
+
+    password = ""
+    dob_codes = _dob_candidates_for_password(profile.get("dob") or profile.get("date_of_birth"))
+    if dob_codes:
+        password = f"{teacher_code}@{dob_codes[0]}"
+    else:
+        password = f"T{teacher_code}@{teacher_code}"
+
+    doc = {
+        "teacher_id": teacher_code,
+        "session": session,
+        "username": username_u,
+        "password": password,
+        "name": teacher_name,
+        "designation": str(profile.get("designation") or profile.get("department") or "").strip()
+    }
+
+    try:
+        teachers_col.insert_one(doc)
+    except Exception:
+        return find_exam_teacher_for_login(username_u)
+    return teachers_col.find_one({"username": username_u, "session": session}) or teachers_col.find_one({"teacher_id": teacher_code})
 
 def _is_sms_response_success(data):
     if isinstance(data, dict):
@@ -757,6 +890,46 @@ def session_variants(session_value):
     if alt == s:
         return [s]
     return [s, alt]
+
+def normalize_dob_candidates(value):
+    """Return candidate dob strings so login works regardless of input format.
+
+    Students may type their DOB as DDMMYYYY (e.g. 18082022). The database
+    typically stores YYYY-MM-DD. This builds all plausible spellings of the
+    same date so the stored value is matched.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return [raw]
+    out = [raw]
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) == 8:
+        dd, mm, yyyy = digits[:2], digits[2:4], digits[4:]
+        try:
+            dt = datetime.strptime(f"{dd}/{mm}/{yyyy}", "%d/%m/%Y")
+            out += [
+                dt.strftime("%Y-%m-%d"),
+                dt.strftime("%Y%m%d"),
+                dt.strftime("%d-%m-%Y"),
+                dt.strftime("%d/%m/%Y"),
+            ]
+        except ValueError:
+            pass
+    else:
+        # Already in a dashed/slashed format: also try converting to YYYY-MM-DD.
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y", "%Y%m%d", "%d%m%Y"):
+            try:
+                dt = datetime.strptime(raw, fmt)
+                out.append(dt.strftime("%Y-%m-%d"))
+                break
+            except ValueError:
+                continue
+    seen, result = set(), []
+    for item in out:
+        if item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
 
 def normalize_student_id(raw):
     if raw is None:
@@ -1431,14 +1604,24 @@ def set_incharge():
     data = request.json or {}
     session = data.get("session")
     class_name = data.get("class_name")
+    raw_incharges = data.get("incharges")
     incharge = data.get("incharge")
 
-    if not session or not class_name or not incharge:
+    incharges = []
+    if isinstance(raw_incharges, list):
+        incharges = [str(t).strip() for t in raw_incharges if str(t).strip()]
+    elif incharge:
+        incharges = [str(t).strip() for t in str(incharge).split(",") if str(t).strip()]
+
+    seen = set()
+    incharges = [t for t in incharges if not (t.lower() in seen or seen.add(t.lower()))]
+
+    if not session or not class_name or not incharges:
         return jsonify({"success": False, "message": "Missing fields"}), 400
 
     class_incharge_col.update_one(
         {"session": session, "class_name": class_name},
-        {"$set": {"incharge": incharge}},
+        {"$set": {"incharge": incharges[0], "incharges": incharges}},
         upsert=True
     )
     return jsonify({"success": True, "message": "Incharge saved"})
@@ -1450,12 +1633,38 @@ def get_incharge():
         return jsonify({"success": False, "message": "Missing session"}), 400
 
     rows = class_incharge_col.find({"session": session})
-    data = {r.get("class_name"): r.get("incharge") for r in rows}
-    return jsonify({"success": True, "incharge": data})
+    data = {}
+    data_multi = {}
+    for r in rows:
+        class_name = r.get("class_name")
+        incharges = r.get("incharges")
+        if not isinstance(incharges, list):
+            incharges = [r.get("incharge")] if r.get("incharge") else []
+        incharges = [
+            str(name).strip()
+            for item in incharges
+            for name in str(item).split(",")
+            if str(name).strip()
+        ]
+        data[class_name] = incharges[0] if incharges else ""
+        data_multi[class_name] = incharges
+    return jsonify({"success": True, "incharge": data, "incharges": data_multi})
 
 # ---------------------------
 # Add marks for students (upsert)
 # ---------------------------
+def normalize_marks_entry(value):
+    text = str(value or "").strip().upper()
+    if text in {"AB", "NA"}:
+        return text
+    if text == "":
+        return 0
+    try:
+        number = float(text)
+        return int(number) if number.is_integer() else number
+    except Exception:
+        raise ValueError("Marks must be a number, AB, or NA")
+
 @app.route("/exam/add-marks", methods=["POST"])
 def add_marks():
     data = request.get_json() or {}
@@ -1480,9 +1689,13 @@ def add_marks():
         marks_value = item.get("marks")
         if roll is None or subject is None or marks_value is None:
             continue
+        try:
+            normalized_marks = normalize_marks_entry(marks_value)
+        except ValueError as e:
+            return jsonify({"success": False, "message": str(e)}), 400
         exam_marks_col.update_one(
             {"session": session, "exam_id": exam_id, "class_name": class_name, "subject": subject, "roll": roll},
-            {"$set": {"marks": int(marks_value)}},
+            {"$set": {"marks": normalized_marks}},
             upsert=True
         )
 
@@ -1539,6 +1752,10 @@ def save_internal_marks():
             marks_value = item.get("marks")
             if not student_id or not student_name or marks_value is None:
                 continue
+            try:
+                normalized_marks = normalize_marks_entry(marks_value)
+            except ValueError as e:
+                return jsonify({"success": False, "message": str(e)}), 400
 
             internal_marks_col.update_one(
                 {
@@ -1551,7 +1768,7 @@ def save_internal_marks():
                 {
                     "$set": {
                         "student_name": student_name,
-                        "marks": int(marks_value),
+                        "marks": normalized_marks,
                         "teacher_id": teacher_id,
                         "exam_name": exam_name,
                         "updated_at": datetime.utcnow()
@@ -2266,10 +2483,21 @@ def login():
             }
         })
 
-    # ---------- TEACHER LOGIN (FROM DATABASE) ----------
-    teacher = teachers_col.find_one({"username": username.upper()})
+    # ---------- TEACHER LOGIN (FROM DATABASE / MASTER TEACHER PROFILE) ----------
+    teacher = find_exam_teacher_for_login(username_upper)
+    direct_profile = None
+    if not teacher:
+        direct_profile = find_student_teacher_profile_for_login(username_upper)
+        if direct_profile and _teacher_password_matches(
+            direct_profile.get("teacher_name"),
+            direct_profile.get("dob") or direct_profile.get("date_of_birth"),
+            password,
+            direct_profile.get("teacher_code") or direct_profile.get("teacher_id")
+        ):
+            teacher = ensure_exam_teacher_from_profile(username_upper, direct_profile)
+
     if teacher:
-        profile = find_student_teacher_profile(teacher)
+        profile = direct_profile or find_student_teacher_profile(teacher)
         if teacher.get("password") == password or _teacher_password_matches(
             profile.get("teacher_name") or teacher.get("name"),
             profile.get("dob"),
@@ -2290,9 +2518,11 @@ def login():
                 }
             })
     # -------- STUDENT LOGIN (MONGODB) --------
+    # Password is the student's DOB. Accept common input formats, including
+    # DDMMYYYY (e.g. 18082022), and match whatever format is stored in the DB.
     student = students_col.find_one({
         "admission_no": username,
-        "dob": password   # OR change to roll / mobile if needed
+        "dob": {"$in": normalize_dob_candidates(password)}
     })
 
     if student:
@@ -2301,7 +2531,12 @@ def login():
         return jsonify({
             "success": True,
             "role": "student",
-            "token": f"student_{username}_token",
+            "token": create_student_token(
+                str(student["_id"]),
+                student.get("admission_no"),
+                student.get("session", ""),
+                student.get("class_name", "")
+            ),
             "student": {
                 "id": str(student["_id"]),
                 "name": student.get("student_name"),
@@ -3792,6 +4027,690 @@ def get_leave_document(filename):
     if os.path.exists(filepath):
         return send_file(filepath)
     return "File Not Found", 404
+
+
+# =====================================================================
+# SECURE STUDENT MOBILE API
+# ---------------------------------------------------------------------
+# The existing web app does not validate tokens. To keep it working while
+# giving the Flutter app real security, student logins now issue a signed
+# JWT, and every /api/student/* endpoint requires that token. Identity is
+# ALWAYS taken from the token (never from a client-supplied student_id).
+# =====================================================================
+from functools import wraps
+
+JWT_SECRET = os.environ.get("JWT_SECRET", "change_this_student_app_secret_2026")
+JWT_ALGO = "HS256"
+JWT_TTL_HOURS = int(os.environ.get("JWT_TTL_HOURS", "72"))
+
+
+def create_student_token(student_id, admission_no, session, class_name):
+    now = datetime.utcnow()
+    payload = {
+        "sub": str(student_id),
+        "admission_no": str(admission_no or ""),
+        "session": str(session or ""),
+        "class_name": str(class_name or ""),
+        "role": "student",
+        "iat": now,
+        "exp": now + timedelta(hours=JWT_TTL_HOURS),
+    }
+    return pyjwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
+
+
+def decode_student_token(token):
+    return pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+
+
+def student_token_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        auth = request.headers.get("Authorization", "")
+        token = None
+        if str(auth).lower().startswith("bearer "):
+            token = str(auth)[7:].strip()
+        if not token:
+            token = str(request.args.get("token") or "").strip()
+        if not token:
+            return jsonify({
+                "success": False,
+                "message": "Missing authentication token",
+                "code": "missing_token"
+            }), 401
+        try:
+            payload = decode_student_token(token)
+        except pyjwt.ExpiredSignatureError:
+            return jsonify({
+                "success": False,
+                "message": "Session expired. Please log in again.",
+                "code": "token_expired"
+            }), 401
+        except Exception:
+            return jsonify({
+                "success": False,
+                "message": "Invalid authentication token",
+                "code": "invalid_token"
+            }), 401
+
+        if payload.get("role") != "student":
+            return jsonify({
+                "success": False,
+                "message": "Student token required",
+                "code": "invalid_token"
+            }), 401
+
+        student_id = payload.get("sub")
+        try:
+            student = students_col.find_one({"_id": ObjectId(student_id)})
+        except Exception:
+            student = None
+        if not student:
+            return jsonify({
+                "success": False,
+                "message": "Student account not found",
+                "code": "student_not_found"
+            }), 401
+
+        request.student = student
+        request.student_payload = payload
+        return f(*args, **kwargs)
+
+    return wrapper
+
+
+def _roll_variants(roll):
+    out = []
+    if roll is None:
+        return out
+    out.append(str(roll).strip())
+    try:
+        out.append(int(str(roll).strip()))
+    except Exception:
+        pass
+    return list(dict.fromkeys(out))
+
+
+def _student_session(s):
+    variants = session_variants(s)
+    if len(variants) > 1:
+        return {"$in": variants}
+    return s if variants else None
+
+
+@app.route("/api/student/profile", methods=["GET"])
+@student_token_required
+def api_student_profile():
+    student = request.student
+    access = get_student_access_flags(student)
+    return jsonify({
+        "success": True,
+        "student": {
+            "id": str(student["_id"]),
+            "name": student.get("student_name") or student.get("name", ""),
+            "admission_no": student.get("admission_no", ""),
+            "class_name": student.get("class_name", ""),
+            "section": student.get("section", ""),
+            "roll": student.get("rollno", ""),
+            "photo_url": student.get("photo_url", ""),
+            "session": student.get("session", ""),
+            "father_name": student.get("father_name", ""),
+            "eligible": access.get("eligible", False),
+            "release_rollno": access.get("release_rollno", False),
+            "release_result": access.get("release_result", False)
+        }
+    })
+
+
+@app.route("/api/student/attendance", methods=["GET"])
+@student_token_required
+def api_student_attendance():
+    student = request.student
+    month = (request.args.get("month") or "").strip()
+    sid = str(student.get("_id"))
+    admission = str(student.get("admission_no", "") or "").strip()
+
+    query = {"class_name": student.get("class_name", "")}
+    session_q = _student_session(student.get("session", ""))
+    if session_q is not None:
+        query["session"] = session_q
+    query["$or"] = [
+        {"student_id": sid},
+        {"student_admission": admission},
+    ]
+    if month:
+        query["date"] = {"$regex": f"^{re.escape(str(month))}-"}
+
+    records = []
+    for att in attendance_col.find(query).sort("date", ASCENDING):
+        records.append({
+            "date": att.get("date", ""),
+            "status": att.get("status", ""),
+            "student_roll": att.get("student_roll", "")
+        })
+
+    summary = {"present": 0, "absent": 0, "leave": 0}
+    for r in records:
+        s = str(r.get("status", "")).lower()
+        if s in summary:
+            summary[s] += 1
+    total_days = sum(summary.values())
+    percentage = round((summary["present"] / total_days * 100), 1) if total_days else 0
+
+    return jsonify({
+        "success": True,
+        "attendance": records,
+        "summary": summary,
+        "total_days": total_days,
+        "percentage": percentage
+    })
+
+
+@app.route("/api/student/exams", methods=["GET"])
+@student_token_required
+def api_student_exams():
+    student = request.student
+    session_q = _student_session(student.get("session", ""))
+    query = {"session": session_q} if session_q is not None else {}
+    rows = []
+    for ex in exams_col.find(query).sort("created_at", ASCENDING):
+        rows.append({
+            "exam_id": str(ex.get("_id")),
+            "exam_name": ex.get("exam_name"),
+            "session": ex.get("session"),
+            "exam_time": ex.get("exam_time"),
+            "total_marks": ex.get("total_marks"),
+            "internal_marks": ex.get("internal_marks", False)
+        })
+    return jsonify({"success": True, "exams": rows})
+
+
+@app.route("/api/student/datesheet", methods=["GET"])
+@student_token_required
+def api_student_datesheet():
+    student = request.student
+    exam_name = (request.args.get("exam_name") or "").strip()
+    if not exam_name:
+        return jsonify({"success": False, "message": "exam_name is required", "datesheet": []}), 400
+
+    session = student.get("session", "")
+    class_name = student.get("class_name", "")
+    session_q = _student_session(session)
+
+    exam_doc = exams_col.find_one({"exam_name": exam_name, "session": session_q} if session_q is not None else {"exam_name": exam_name})
+    if not exam_doc:
+        return jsonify({"success": False, "message": "Exam not found", "datesheet": []}), 404
+
+    exam_time = exam_doc.get("exam_time", "")
+    total_marks = exam_doc.get("total_marks", "")
+    subjects = [row.get("subject") for row in exam_subjects_col.find({
+        "class_name": class_name,
+        "session": session
+    })]
+    date_map = {}
+    for d in datesheet_col.find({
+        "class_name": class_name,
+        "session": session,
+        "exam_name": exam_name
+    }):
+        date_map[d.get("subject")] = d.get("date")
+
+    final = []
+    for sub in subjects:
+        final.append({
+            "subject": sub,
+            "date": date_map.get(sub, ""),
+            "total_marks": total_marks,
+            "duration": exam_time
+        })
+
+    return jsonify({"success": True, "datesheet": final})
+
+
+@app.route("/api/student/results", methods=["GET"])
+@student_token_required
+def api_student_results():
+    student = request.student
+    access = get_student_access_flags(student)
+
+    if not access.get("eligible") or not access.get("release_result"):
+        return jsonify({
+            "success": True,
+            "released": False,
+            "message": "Results have not been released yet.",
+            "results": []
+        })
+
+    session = student.get("session", "")
+    class_name = student.get("class_name", "")
+    roll = student.get("rollno", "")
+    session_q = _student_session(session)
+
+    exams = list(exams_col.find({"session": session_q} if session_q is not None else {}))
+    results = []
+    for ex in exams:
+        exam_name = ex.get("exam_name")
+        pub = result_publish_col.find_one({
+            "session": session,
+            "class_name": class_name,
+            "exam_name": exam_name
+        })
+        if not (pub and to_bool(pub.get("published"), False)):
+            continue
+        exam_id = ex.get("_id")
+        marks_map = {}
+        for row in exam_marks_col.find({
+            "session": session,
+            "class_name": class_name,
+            "exam_id": exam_id,
+            "roll": {"$in": _roll_variants(roll)}
+        }):
+            marks_map[row.get("subject")] = row.get("marks")
+
+        if not marks_map:
+            continue
+
+        subject_rows = []
+        total_obtained = 0
+        total_max = 0
+        for subject, value in marks_map.items():
+            subject_rows.append({"subject": subject, "marks": value})
+            try:
+                numeric = float(value)
+                if str(value).strip().upper() not in ("AB", "NA"):
+                    total_obtained += numeric
+            except (TypeError, ValueError):
+                pass
+
+        try:
+            total_max = float(ex.get("total_marks") or 0)
+        except (TypeError, ValueError):
+            total_max = 0
+
+        percentage = round((total_obtained / total_max * 100), 1) if total_max else 0
+        results.append({
+            "exam_id": str(ex.get("_id")),
+            "exam_name": exam_name,
+            "session": ex.get("session"),
+            "total_marks": ex.get("total_marks"),
+            "subjects": subject_rows,
+            "total_obtained": round(total_obtained, 2),
+            "percentage": percentage
+        })
+
+    return jsonify({"success": True, "released": True, "results": results})
+
+
+@app.route("/api/student/homework", methods=["GET"])
+@student_token_required
+def api_student_homework():
+    student = request.student
+    date = (request.args.get("date") or "").strip()
+    if not date:
+        return jsonify({"success": False, "message": "date is required (YYYY-MM-DD)", "rows": []}), 400
+
+    rows = list(teacher_daily_work_col.find({
+        "session": student.get("session", ""),
+        "class_name": student.get("class_name", ""),
+        "date": date
+    }, {"_id": 0}))
+
+    return jsonify({"success": True, "rows": rows})
+
+
+@app.route("/api/student/notices", methods=["GET"])
+@student_token_required
+def api_student_notices():
+    student = request.student
+    session = student.get("session", "")
+    query = {"target": {"$in": ["student", "both"]}}
+    if session:
+        query["session"] = session
+
+    notices = []
+    for n in notices_col.find(query).sort("uploaded_at", -1):
+        notices.append({
+            "id": str(n["_id"]),
+            "title": n.get("title"),
+            "description": n.get("description"),
+            "date": n.get("date"),
+            "session": n.get("session", ""),
+            "target": n.get("target", "student"),
+            "file": n.get("file"),
+            "url": f"/notice/get-file/{n.get('file')}" if n.get("file") else None
+        })
+    return jsonify({"success": True, "notices": notices})
+
+
+@app.route("/api/student/syllabus", methods=["GET"])
+@student_token_required
+def api_student_syllabus():
+    student = request.student
+    subject = clean_text(request.args.get("subject"))
+    session = student.get("session", "")
+    class_name = normalize_class_name(student.get("class_name", ""))
+    session_q = _student_session(session)
+
+    query = {"class_name": class_name}
+    if session_q is not None:
+        query["session"] = session_q
+    if subject:
+        subject_key = normalize_subject_name(subject)
+        query["$or"] = [
+            {"subject_key": subject_key},
+            {"subject": {"$regex": f"^{re.escape(subject)}$", "$options": "i"}}
+        ]
+
+    rows = []
+    cursor = syllabus_col.find(query, {"_id": 0}).sort([
+        ("class_name", ASCENDING),
+        ("subject", ASCENDING),
+        ("exam_sort", ASCENDING),
+        ("exam_name", ASCENDING),
+        ("chapter_sort", ASCENDING),
+    ])
+    for row in cursor:
+        rows.append({
+            "session": row.get("session"),
+            "class_name": row.get("class_name"),
+            "subject": row.get("subject"),
+            "exam_name": row.get("exam_name"),
+            "chapter": row.get("chapter", ""),
+            "description": row.get("description", ""),
+            "exam_sort": row.get("exam_sort"),
+            "chapter_sort": row.get("chapter_sort"),
+            "subject_key": row.get("subject_key", "")
+        })
+
+    return jsonify({"success": True, "syllabus": rows})
+
+
+@app.route("/api/student/timetable", methods=["GET"])
+@student_token_required
+def api_student_timetable():
+    """Class-wise timetable for the logged-in student (period x weekday grid)."""
+    student = request.student
+    session = student.get("session", "")
+    class_name = student.get("class_name", "")
+    session_q = _student_session(session)
+    if session_q is None:
+        return jsonify({"success": True, "timetable": []})
+
+    cursor = timetable_col.find({
+        "session": session_q,
+        "class": class_name
+    }).sort("period", ASCENDING)
+
+    weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+    output = []
+    for row in cursor:
+        teacher_name = ""
+        teacher_id = str(row.get("teacher_id", "")).strip()
+        if teacher_id:
+            try:
+                if ObjectId.is_valid(teacher_id):
+                    t_doc = teachers_col.find_one({"_id": ObjectId(teacher_id)})
+                else:
+                    t_doc = teachers_col.find_one({"teacher_id": teacher_id})
+                if t_doc:
+                    teacher_name = t_doc.get("name", "") or ""
+            except Exception:
+                teacher_name = ""
+
+        entry = {
+            "period": row.get("period"),
+            "startDay": int(row.get("startDay", 1)),
+            "endDay": int(row.get("endDay", 1)),
+        }
+        for day in weekdays:
+            subject = str(row.get(day.lower(), "") or "").strip()
+            if subject:
+                entry[day] = f"{teacher_name} - {subject}" if teacher_name else subject
+            else:
+                entry[day] = ""
+        output.append(entry)
+
+    return jsonify({"success": True, "timetable": output})
+
+
+@app.route("/api/student/fee", methods=["GET"])
+@student_token_required
+def api_student_fee():
+    """Fee record summary for the logged-in student (read-only, fee ERP DB)."""
+    student = request.student
+    admission_no = str(student.get("admission_no", "") or "").strip()
+    session = _student_session(student.get("session", "")) or ""
+
+    if fee_db is None or not admission_no:
+        return jsonify({"success": True, "fee": None})
+
+    fee_student = fee_db.students.find_one({"admission_no": admission_no})
+    if fee_student is None:
+        return jsonify({"success": True, "fee": None})
+
+    student_id = str(fee_student.get("_id"))
+    dues = list(fee_db.fee_history.find({
+        "student_id": student_id,
+        "type": "due",
+        "status": {"$in": ["unpaid", "partial"]}
+    }).sort("month", 1))
+
+    pending_total = 0.0
+    paid_total = 0.0
+    months_due = set()
+    head_counts = {}
+    for d in dues:
+        remaining = float(d.get("remaining", 0) or 0)
+        fine = float(d.get("fine", 0) or 0)
+        pending_total += remaining + fine
+        paid_total += float(d.get("paid_amount", 0) or 0)
+        month = str(d.get("month", "") or "").strip()
+        if month:
+            months_due.add(month)
+        head = str(d.get("head", "") or "").strip()
+        if head:
+            head_counts[head] = head_counts.get(head, 0) + 1
+
+    return jsonify({
+        "success": True,
+        "fee": {
+            "admission_no": admission_no,
+            "student_name": fee_student.get("name", "") or student.get("name", ""),
+            "class_name": fee_student.get("class_name", "") or student.get("class_name", ""),
+            "section": fee_student.get("section", "") or student.get("section", ""),
+            "session": fee_student.get("session", "") or session,
+            "pending_total": round(pending_total, 2),
+            "paid_total": round(paid_total, 2),
+            "months_due": sorted(m for m in months_due if m),
+            "due_count": len(dues),
+            "heads": head_counts,
+            "generated": len(dues) > 0,
+        }
+    })
+
+
+@app.route("/api/student/grievances", methods=["GET"])
+@student_token_required
+def api_student_grievances():
+    sid = str(request.student.get("_id"))
+    rows = [grievance_to_dict(g) for g in grievances_col.find({"student_id": sid}).sort("submitted_at", -1)]
+    return jsonify({"success": True, "grievances": rows})
+
+
+@app.route("/api/student/grievances", methods=["POST"])
+@student_token_required
+def api_student_submit_grievance():
+    student = request.student
+    data = request.get_json(silent=True) or {}
+    category = str(data.get("category", "") or "").strip()
+    gtype = str(data.get("type", "") or "").strip()
+    subject = str(data.get("subject", "") or "").strip()
+    description = str(data.get("description", "") or "").strip()
+
+    if not category or not gtype or not subject or not description:
+        return jsonify({
+            "success": False,
+            "message": "Category, type, subject and description are required"
+        }), 400
+
+    sid = str(student.get("_id"))
+    doc = {
+        "student_id": sid,
+        "student_name": student.get("student_name") or student.get("name") or "",
+        "admission_no": student.get("admission_no", ""),
+        "class_name": student.get("class_name", ""),
+        "roll": student.get("rollno", ""),
+        "session": student.get("session", ""),
+        "category": category,
+        "type": gtype,
+        "subject": subject,
+        "description": description,
+        "status": "pending",
+        "admin_note": "",
+        "submitted_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
+    }
+    res = grievances_col.insert_one(doc)
+    return jsonify({"success": True, "message": "Grievance submitted", "id": str(res.inserted_id)}), 201
+
+
+@app.route("/api/student/certificates", methods=["GET"])
+@student_token_required
+def api_student_certificates():
+    student = request.student
+    sid = str(student.get("_id"))
+    session = student.get("session", "")
+    class_name = student.get("class_name", "")
+    sessions = session_variants(session)
+
+    perms = {}
+    for cert_type in CERTIFICATE_TYPES:
+        doc = certificate_access_col.find_one({
+            "session": {"$in": sessions},
+            "class_name": class_name,
+            "student_id": sid,
+            "certificate_type": cert_type,
+        }) if sessions else certificate_access_col.find_one({
+            "class_name": class_name,
+            "student_id": sid,
+            "certificate_type": cert_type,
+        })
+        perms[cert_type] = to_bool(doc.get("allowed"), False) if doc else False
+
+    return jsonify({
+        "success": True,
+        "certificates": perms,
+        "session": session,
+        "class_name": class_name
+    })
+
+
+@app.route("/api/student/certificate/<cert_type>", methods=["GET"])
+@student_token_required
+def api_student_certificate_view(cert_type):
+    student = request.student
+    key = certificate_permission_key(cert_type)
+    if key not in CERTIFICATE_TYPES:
+        return jsonify({"success": False, "message": "Invalid certificate type"}), 400
+
+    sid = str(student.get("_id"))
+    session = student.get("session", "")
+    class_name = student.get("class_name", "")
+    sessions = session_variants(session)
+
+    doc = certificate_access_col.find_one({
+        "session": {"$in": sessions},
+        "class_name": class_name,
+        "student_id": sid,
+        "certificate_type": key,
+    }) if sessions else certificate_access_col.find_one({
+        "class_name": class_name,
+        "student_id": sid,
+        "certificate_type": key,
+    })
+    if not doc or not to_bool(doc.get("allowed"), False):
+        return "<h3 style='font-family:sans-serif'>Certificate is not available for you. Please contact the school office.</h3>", 403
+
+    cert_titles = {
+        "bonafide": "BONAFIDE CERTIFICATE",
+        "character": "CHARACTER CERTIFICATE",
+        "study": "STUDY CERTIFICATE",
+        "tc": "TRANSFER CERTIFICATE",
+    }
+    cert_bodies = {
+        "bonafide": (
+            "This is to certify that <b>{name}</b>, son/daughter of "
+            "<b>{father}</b>, is a bonafide student of this institution and "
+            "is studying in <b>{class_section}</b> during the session "
+            "<b>{session}</b> (Admission No. {admission}, Roll No. {roll})."
+        ),
+        "character": (
+            "This is to certify that <b>{name}</b>, son/daughter of "
+            "<b>{father}</b>, was a student of this institution during the "
+            "session <b>{session}</b> (Admission No. {admission}, Roll No. "
+            "{roll}). To the best of our knowledge, his/her conduct and "
+            "character have been good during his/her stay."
+        ),
+        "study": (
+            "This is to certify that <b>{name}</b>, son/daughter of "
+            "<b>{father}</b>, was a student of this institution in "
+            "<b>{class_section}</b> during the session <b>{session}</b> "
+            "(Admission No. {admission}, Roll No. {roll}). He/she is a "
+            "sincere and regular student."
+        ),
+        "tc": (
+            "This is to certify that <b>{name}</b>, son/daughter of "
+            "<b>{father}</b>, was a student of this institution in "
+            "<b>{class_section}</b> during the session <b>{session}</b> "
+            "(Admission No. {admission}, Roll No. {roll}). He/she has been "
+            "granted transfer from this institution and all school dues "
+            "have been cleared."
+        ),
+    }
+
+    name = student.get("student_name") or student.get("name") or ""
+    father = student.get("father_name", "") or ""
+    section = student.get("section", "") or ""
+    class_section = class_name + (f" - {section}" if section else "")
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>{cert_titles.get(key, 'CERTIFICATE')}</title>
+<style>
+  body {{ font-family: Georgia, 'Times New Roman', serif; color: #111; margin: 0; padding: 24px; }}
+  .page {{ max-width: 720px; margin: 0 auto; border: 3px double #333; padding: 36px 44px; }}
+  .school {{ text-align: center; font-size: 22px; font-weight: bold; letter-spacing: 1px; }}
+  .school-sub {{ text-align: center; font-size: 13px; margin-top: 4px; color: #444; }}
+  .title {{ text-align: center; font-size: 18px; font-weight: bold; margin: 26px 0; text-decoration: underline; }}
+  .body {{ font-size: 15px; line-height: 1.9; text-align: justify; min-height: 150px; }}
+  .sign {{ display: flex; justify-content: space-between; margin-top: 60px; font-size: 13px; }}
+  .footer {{ text-align: center; font-size: 11px; margin-top: 20px; color: #777; }}
+  @media print {{ body {{ padding: 0; }} .page {{ border-width: 2px; }} }}
+</style>
+</head>
+<body>
+  <div class="page">
+    <div class="school">SCHOOL NAME</div>
+    <div class="school-sub">(An Institution of Excellence)</div>
+    <div class="title">{cert_titles.get(key, 'CERTIFICATE')}</div>
+    <div class="body">
+      {cert_bodies.get(key, '').format(name=name, father=father, class_section=class_section, session=session, admission=student.get('admission_no', ''), roll=student.get('rollno', ''))}
+    </div>
+    <div class="sign">
+      <div>Date: {datetime.utcnow().strftime('%d-%m-%Y')}</div>
+      <div>Signature of Principal<br/>(with seal)</div>
+    </div>
+    <div class="footer">Certificate No: {key.upper()}-{sid[:8]}-{student.get('admission_no', '')}</div>
+  </div>
+</body>
+</html>"""
+    return Response(html, mimetype="text/html")
+
+
+@app.route("/api/health", methods=["GET"])
+def api_health():
+    return jsonify({"success": True, "service": "exam-backend", "status": "ok"})
+
 
 import os
 
