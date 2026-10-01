@@ -1583,6 +1583,21 @@ def normalize_marks_value(value):
 def class_name_match(value):
     return {"$regex": "^" + re.escape(str(value or "").strip()) + "$", "$options": "i"}
 
+def is_ut1_exam_name(value):
+    """Accept the UT-1 spellings used across older and newer exam records."""
+    normalized = re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+    return normalized in ("ut1", "unittest1")
+
+def convert_ut1_marks_to_ten(value):
+    """UT-1 is entered out of 20; internal marks use the equivalent out of 10."""
+    text = str(value).strip().upper() if value is not None else ""
+    if text in ("A", "AB"):
+        return "AB"
+    if text in ("N", "NA", ""):
+        return "NA"
+    converted = float(value) / 2
+    return int(converted) if converted.is_integer() else converted
+
 @app.route("/exam/add-marks", methods=["POST"])
 def add_marks():
     data = request.get_json() or {}
@@ -1644,6 +1659,43 @@ def get_marks():
             "roll": row.get("roll"),
             "subject": row.get("subject"),
             "marks": row.get("marks")
+        })
+    return jsonify({"success": True, "marks": marks})
+
+@app.route("/internal-marks/ut1-source", methods=["GET"])
+def get_ut1_source_marks():
+    """Return completed UT-1 marks, including the original /20 and internal /10 values."""
+    session = request.args.get("session")
+    class_name = request.args.get("class_name")
+    subject = request.args.get("subject")
+
+    if not session or not class_name or not subject:
+        return jsonify({"success": False, "message": "Missing parameters", "marks": []}), 400
+
+    ut1_exam_ids = [
+        exam.get("_id")
+        for exam in exams_col.find({"session": session}, {"_id": 1, "exam_name": 1})
+        if is_ut1_exam_name(exam.get("exam_name"))
+    ]
+    if not ut1_exam_ids:
+        return jsonify({"success": True, "marks": []})
+
+    cursor = exam_marks_col.find({
+        "session": session,
+        "class_name": class_name_match(class_name),
+        "subject": {"$regex": "^" + re.escape(str(subject).strip()) + "$", "$options": "i"},
+        "exam_id": {"$in": ut1_exam_ids}
+    })
+    marks = []
+    for row in cursor:
+        try:
+            converted = convert_ut1_marks_to_ten(row.get("marks"))
+        except (TypeError, ValueError):
+            continue
+        marks.append({
+            "roll": str(row.get("roll", "")).strip(),
+            "raw_marks": row.get("marks"),
+            "marks": converted
         })
     return jsonify({"success": True, "marks": marks})
 
